@@ -106,7 +106,10 @@ class ISAM:
         if distance_since_last < min_distance_since_last and angle_diff_since_last < angle_threshold:
             return None
         
-        for n in self.pose_graph.nodes:
+        # Limit search to 30 most recent nodes instead of all nodes (O(n) → O(30))
+        recent_nodes = list(self.pose_graph.nodes)[-30:] if len(self.pose_graph.nodes) > 30 else list(self.pose_graph.nodes)
+        
+        for n in recent_nodes:
             if n == self.previous_node:
                 continue
             

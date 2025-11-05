@@ -56,15 +56,15 @@ class Robot:
         self.movement_speed = 1  # Grid cells per move
         self.rotation_angle = 0  # Current rotation angle in degrees
         self.target_rotation = 0  # Target rotation angle
-        self.rotation_speed = 90  # Degrees per rotation
+        self.rotation_speed = 180  # Degrees per rotation (increased from 90°)
         
         # Robot state
         self.current_goal = None
         self.has_cargo = False
         self.last_move_time = 0
-        self.move_cooldown = 100  # milliseconds between moves
+        self.move_cooldown = 25  # milliseconds between moves (increased speed from 50ms to 25ms)
         self.last_action_time = 0
-        self.action_cooldown = 300  # milliseconds between actions
+        self.action_cooldown = 200  # milliseconds between actions (reduced from 300ms)
         self.score = 0
         
         # Mapping and exploration
@@ -96,6 +96,11 @@ class Robot:
         self.visited = set()  # Set of (x, y) visited cells
         self.stack = []  # Stack for backtracking: [(x, y), ...]
         
+        # Cached exploration completeness check
+        self.has_unknown_adjacent_cached = True  # Start with True, will be updated incrementally
+        self.last_unknown_check_time = 0  # Track when we last checked (in frames)
+        self.unknown_check_interval = 60  # Re-check every 60 frames (~1 second at 60 FPS)
+        
         # Return to start after exploration
         self.return_path = []  # Path back to start position
         self.return_path_index = 0
@@ -105,6 +110,10 @@ class Robot:
         self.delivery_path_index = 0
         self.delivery_mode = "PICKUP"  # PICKUP or DROPOFF
         self.goals_to_deliver = []  # Remaining goals to deliver (in priority order)
+        
+        # Path caching to avoid redundant A* calculations
+        self.path_cache = {}  # Cache: {(start, target): path}
+        self.path_cache_max_size = 100  # Maximum number of cached paths
         
         debug_log(f"Robot initialized at ({x}, {y}) with DFS coverage exploration")
     
@@ -146,6 +155,14 @@ class Robot:
             # Mark current cell as explored
             current_x, current_y = int(self.x), int(self.y)
             self.ogm.mark_explored(current_x, current_y)
+            
+            # Update cached unknown check incrementally
+            if hasattr(self, 'has_unknown_adjacent_cached'):
+                if not self.check_unknown_adjacent_incremental(current_x, current_y):
+                    # If this cell and its neighbors don't have unknown adjacent, 
+                    # we might still have unknown elsewhere, but we'll check when stack is empty
+                    # For now, keep the cached value as is (we'll do full check when needed)
+                    pass
             
             # Check if we're at a goal position and mark it
             for goal in self.warehouse.goals:
@@ -242,6 +259,75 @@ class Robot:
                     return (nx, ny)
         return None
     
+    def check_unknown_adjacent_incremental(self, x, y):
+        """Check if a newly explored cell (x, y) or its neighbors have unknown adjacent cells."""
+        # Check if this cell or its neighbors are FREE/GOAL and have UNKNOWN neighbors
+        cell_state = self.ogm.get_cell_state(x, y)
+        if cell_state == FREE or cell_state == GOAL:
+            # Check if this cell has UNKNOWN neighbors
+            for nx, ny in self.neighbors4(x, y):
+                if self.ogm.is_unknown(nx, ny):
+                    return True
+            # Check neighbors of this cell
+            for nx, ny in self.neighbors4(x, y):
+                neighbor_state = self.ogm.get_cell_state(nx, ny)
+                if neighbor_state == FREE or neighbor_state == GOAL:
+                    for nnx, nny in self.neighbors4(nx, ny):
+                        if self.ogm.is_unknown(nnx, nny):
+                            return True
+        return False
+    
+    def check_unknown_adjacent_full(self):
+        """Full grid scan to check if any FREE/GOAL cell has an UNKNOWN neighbor."""
+        # Only do full scan when absolutely necessary (when stack is empty)
+        for y in range(WAREHOUSE_HEIGHT):
+            for x in range(WAREHOUSE_WIDTH):
+                cell_state = self.ogm.get_cell_state(x, y)
+                if cell_state == FREE or cell_state == GOAL:
+                    # Check if any neighbor is UNKNOWN
+                    for nx, ny in self.neighbors4(x, y):
+                        if self.ogm.is_unknown(nx, ny):
+                            return True
+        return False
+    
+    def validate_exploration_complete(self):
+        """Validate that exploration is complete (no UNKNOWN cells adjacent to FREE/GOAL cells)."""
+        has_unknown = self.check_unknown_adjacent_full()
+        self.has_unknown_adjacent_cached = has_unknown
+        if has_unknown:
+            debug_log("WARNING: Exploration not complete - UNKNOWN cells still adjacent to FREE/GOAL cells")
+            return False
+        debug_log("Exploration validation passed - no UNKNOWN cells adjacent to FREE/GOAL cells")
+        return True
+    
+    def astar_cached(self, start, target, allow_goals=True):
+        """
+        A* pathfinding with caching to avoid redundant calculations.
+        
+        Args:
+            start: (x, y) starting position
+            target: (x, y) target position
+            allow_goals: If True, GOAL cells are traversable
+            
+        Returns:
+            list: Path as list of (x, y) tuples, or None if unreachable
+        """
+        # Check cache first
+        cache_key = (start, target, allow_goals)
+        if cache_key in self.path_cache:
+            return self.path_cache[cache_key]
+        
+        # Plan path using A* module
+        path = astar(start, target, self.ogm, allow_goals=allow_goals)
+        
+        # Cache the result (limit cache size)
+        if len(self.path_cache) >= self.path_cache_max_size:
+            # Remove oldest entry (simple FIFO)
+            oldest_key = next(iter(self.path_cache))
+            del self.path_cache[oldest_key]
+        
+        self.path_cache[cache_key] = path
+        return path
     
     def astar(self, start, target):
         """
@@ -260,8 +346,8 @@ class Robot:
         start_xy = (sc, sr)  # (x, y)
         target_xy = (tc, tr)  # (x, y)
         
-        # Use A* module
-        path = astar(start_xy, target_xy, self.ogm, allow_goals=True)
+        # Use cached A* method
+        path = self.astar_cached(start_xy, target_xy, allow_goals=True)
         
         if path:
             # Convert path from (x, y) to (row, col)
@@ -275,15 +361,36 @@ class Robot:
         current_pos = (int(self.x), int(self.y))  # (x, y)
         start_pos = (int(self.start_x), int(self.start_y))  # (x, y)
         
-        # Plan path using A* module
-        path = astar(current_pos, start_pos, self.ogm, allow_goals=True)
+        # Ensure start position is marked as FREE in OGM
+        if self.ogm:
+            self.ogm.mark_free(int(self.start_x), int(self.start_y))
+            self.ogm.mark_explored(int(self.start_x), int(self.start_y))
         
-        if path and len(path) > 1:
-            self.return_path = path[1:]  # Skip first cell (current position)
+        # Ensure current position is marked as FREE in OGM
+        if self.ogm:
+            self.ogm.mark_free(int(self.x), int(self.y))
+            self.ogm.mark_explored(int(self.x), int(self.y))
+        
+        debug_log(f"Planning return path from ({current_pos[0]}, {current_pos[1]}) to ({start_pos[0]}, {start_pos[1]})")
+        
+        # Plan path using cached A* method
+        path = self.astar_cached(current_pos, start_pos, allow_goals=True)
+        
+        if path:
+            if len(path) > 1:
+                self.return_path = path[1:]  # Skip first cell (current position)
+            else:
+                # Already at start or path is just one cell
+                self.return_path = []
             self.return_path_index = 0
-            debug_log(f"Planned return path to start: {len(self.return_path)} steps")
+            debug_log(f"Planned return path to start: {len(self.return_path)} steps (path length: {len(path)})")
         else:
-            debug_log("Warning: Could not plan path to start position")
+            debug_log(f"Warning: Could not plan path from ({current_pos[0]}, {current_pos[1]}) to ({start_pos[0]}, {start_pos[1]})")
+            # Check OGM states for debugging
+            if self.ogm:
+                current_state = self.ogm.get_cell_state(current_pos[0], current_pos[1])
+                start_state = self.ogm.get_cell_state(start_pos[0], start_pos[1])
+                debug_log(f"  Current position state: {current_state}, Start position state: {start_state}")
             self.return_path = []
             self.return_path_index = 0
     
@@ -309,9 +416,6 @@ class Robot:
         if current_time - self.last_move_time < self.move_cooldown:
             return False
         
-        # Update sensor
-        self.update_with_sensor()
-        
         # Mark current cell as visited
         current_pos = (int(self.x), int(self.y))
         if current_pos not in self.visited:
@@ -331,7 +435,9 @@ class Robot:
                     dx = nx - int(self.x)
                     dy = ny - int(self.y)
                     self.rotate_towards(dx, dy)
-                    debug_log(f"DFS: Moving to unvisited neighbor ({nx}, {ny}), stack size: {len(self.stack)}")
+                    # Only log significant stack size changes (every 10 cells or when stack size changes significantly)
+                    if len(self.stack) % 10 == 0 or len(self.stack) == 1:
+                        debug_log(f"DFS: Exploring - stack size: {len(self.stack)}, visited: {len(self.visited)}")
                     return True
                 else:
                     # Move failed, pop from stack and mark as visited to avoid retry
@@ -350,45 +456,49 @@ class Robot:
                         dx = px - int(self.x)
                         dy = py - int(self.y)
                         self.rotate_towards(dx, dy)
-                        debug_log(f"DFS: Backtracking to ({px}, {py}), stack size: {len(self.stack)}")
+                        # Only log significant backtrack events (every 10 stack pops or when stack becomes small)
+                        if len(self.stack) % 10 == 0 or len(self.stack) < 5:
+                            debug_log(f"DFS: Backtracking - stack size: {len(self.stack)}, visited: {len(self.visited)}")
                         return True
                     else:
                         # Backtrack failed, try next position in stack
-                        debug_log(f"DFS: Backtrack failed to ({px}, {py}), trying next")
+                        # Only log failures, not every attempt
+                        if len(self.stack) % 10 == 0:
+                            debug_log(f"DFS: Backtrack failed, stack size: {len(self.stack)}")
                         return False
                 else:
                     # Stack empty - check if exploration is complete (100% parsed)
-                    # Check if any FREE or GOAL cell has an UNKNOWN neighbor
-                    has_unknown_adjacent = False
-                    for y in range(WAREHOUSE_HEIGHT):
-                        for x in range(WAREHOUSE_WIDTH):
-                            cell_state = self.ogm.get_cell_state(x, y)
-                            if cell_state == FREE or cell_state == GOAL:
-                                # Check if any neighbor is UNKNOWN
-                                for nx, ny in self.neighbors4(x, y):
-                                    if self.ogm.is_unknown(nx, ny):
-                                        has_unknown_adjacent = True
-                                        break
-                                if has_unknown_adjacent:
-                                    break
-                        if has_unknown_adjacent:
-                            break
+                    # Use cached value and only re-check every 60 frames (~1 second) to reduce expensive scans
+                    current_frame = current_time // (1000 // 60)  # Approximate frame count
+                    if current_frame - self.last_unknown_check_time >= self.unknown_check_interval:
+                        has_unknown_adjacent = self.check_unknown_adjacent_full()
+                        self.has_unknown_adjacent_cached = has_unknown_adjacent
+                        self.last_unknown_check_time = current_frame
+                    else:
+                        # Use cached value
+                        has_unknown_adjacent = self.has_unknown_adjacent_cached
                     
                     if not has_unknown_adjacent:
                         # No UNKNOWN cells adjacent to FREE/GOAL cells - 100% exploration complete!
-                        debug_log("=" * 50)
-                        debug_log("EXPLORATION COMPLETE! 100% map parsed!")
-                        debug_log(f"Visited: {len(self.visited)} cells")
-                        debug_log(f"Goals discovered: {len(self.ogm.goals)}")
-                        debug_log("Breaking out and returning to start position...")
-                        debug_log("=" * 50)
-                        
-                        # Break out: switch to return mode
-                        self.exploration_mode = "RETURN_TO_START"
-                        self.mapping_complete = True
-                        # Plan path back to start
-                        self.plan_return_to_start()
-                        return True
+                        # Validate exploration completeness before transitioning
+                        if self.validate_exploration_complete():
+                            debug_log("=" * 50)
+                            debug_log("EXPLORATION COMPLETE! 100% map parsed!")
+                            debug_log(f"Visited: {len(self.visited)} cells")
+                            debug_log(f"Goals discovered: {len(self.ogm.goals)}")
+                            debug_log("Breaking out and returning to start position...")
+                            debug_log("=" * 50)
+                            
+                            # Break out: switch to return mode
+                            self.exploration_mode = "RETURN_TO_START"
+                            self.mapping_complete = True
+                            # Plan path back to start
+                            self.plan_return_to_start()
+                            return True
+                        else:
+                            # Validation failed - should not happen, but handle gracefully
+                            debug_log("ERROR: Exploration validation failed despite check passing")
+                            return False
                     else:
                         # Still have unknown cells but no path to them
                         debug_log("DFS: Stack empty but unknown cells remain - may be unreachable")
@@ -396,6 +506,22 @@ class Robot:
         
         elif self.exploration_mode == "RETURN_TO_START":
             # After 100% exploration, return to starting position
+            # Check if already at start position
+            if abs(self.x - self.start_x) < 0.5 and abs(self.y - self.start_y) < 0.5:
+                # Already at start - transition to delivery phase
+                debug_log("=" * 50)
+                debug_log(f"RETURNED TO START POSITION ({int(self.start_x)}, {int(self.start_y)})")
+                debug_log("Exploration mission complete!")
+                debug_log("Starting goal delivery phase...")
+                debug_log("=" * 50)
+                
+                # Switch to goal delivery mode
+                self.exploration_mode = "DELIVER_GOALS"
+                self.delivery_mode = "PICKUP"
+                # Plan goal delivery paths
+                self.plan_goal_delivery()
+                return True
+            
             if not hasattr(self, 'return_path') or not self.return_path:
                 # Plan return path if not already planned
                 self.plan_return_to_start()
@@ -415,23 +541,31 @@ class Robot:
                             dx = nx2 - nx
                             dy = ny2 - ny
                             self.rotate_towards(dx, dy)
-                        debug_log(f"Returning to start: ({nx}, {ny}), {len(self.return_path) - self.return_path_index} steps remaining")
+                        # Only log every 10 steps or when near completion
+                        remaining = len(self.return_path) - self.return_path_index
+                        if remaining % 10 == 0 or remaining < 5:
+                            debug_log(f"Returning to start: {remaining} steps remaining")
                         return True
             else:
                 # Reached start position
                 if abs(self.x - self.start_x) < 0.5 and abs(self.y - self.start_y) < 0.5:
-                    debug_log("=" * 50)
-                    debug_log(f"RETURNED TO START POSITION ({int(self.start_x)}, {int(self.start_y)})")
-                    debug_log("Exploration mission complete!")
-                    debug_log("Starting goal delivery phase...")
-                    debug_log("=" * 50)
-                    
-                    # Switch to goal delivery mode
-                    self.exploration_mode = "DELIVER_GOALS"
-                    self.delivery_mode = "PICKUP"
-                    # Plan goal delivery paths
-                    self.plan_goal_delivery()
-                    return True
+                    # Validate exploration completeness before starting delivery
+                    if self.validate_exploration_complete():
+                        debug_log("=" * 50)
+                        debug_log(f"RETURNED TO START POSITION ({int(self.start_x)}, {int(self.start_y)})")
+                        debug_log("Exploration mission complete!")
+                        debug_log("Starting goal delivery phase...")
+                        debug_log("=" * 50)
+                        
+                        # Switch to goal delivery mode
+                        self.exploration_mode = "DELIVER_GOALS"
+                        self.delivery_mode = "PICKUP"
+                        # Plan goal delivery paths
+                        self.plan_goal_delivery()
+                        return True
+                    else:
+                        debug_log("ERROR: Cannot start delivery - exploration not complete")
+                        return False
         
         elif self.exploration_mode == "DELIVER_GOALS":
             # Goal delivery phase: pick up goals and deliver to discharge dock
@@ -441,37 +575,51 @@ class Robot:
                 
                 # Check if we're at a goal (pickup mode)
                 if self.delivery_mode == "PICKUP" and not self.has_cargo:
-                    # Check if we're already at a goal
-                    at_goal = False
-                    for goal in self.goals_to_deliver:
-                        goal_x, goal_y = goal[0], goal[1]
-                        if abs(self.x - goal_x) < 0.5 and abs(self.y - goal_y) < 0.5:
-                            # Pick up cargo
-                            self.has_cargo = True
-                            self.current_goal = goal
-                            self.delivery_mode = "DROPOFF"
-                            debug_log(f"Picked up cargo at goal ({goal_x}, {goal_y})")
-                            
-                            # Plan path to discharge dock
-                            discharge_dock = self.warehouse.discharge_dock
-                            if discharge_dock:
-                                path = astar(current_pos, discharge_dock, self.ogm, allow_goals=True)
-                                if path and len(path) > 1:
-                                    self.delivery_path = path[1:]
-                                    self.delivery_path_index = 0
-                                    debug_log(f"Planned path to discharge dock: {len(self.delivery_path)} steps")
-                                    return False
-                            at_goal = True
-                            break
+                    # Always process goals in priority order (first goal in list)
+                    if not self.goals_to_deliver:
+                        # No more goals
+                        debug_log("All goals delivered!")
+                        self.is_mapping = False
+                        return False
                     
-                    # If not at a goal, plan path to next goal
-                    if not at_goal and self.goals_to_deliver:
-                        next_goal = self.goals_to_deliver[0]
-                        path = astar(current_pos, next_goal, self.ogm, allow_goals=True)
+                    # Get the first priority goal
+                    next_goal = self.goals_to_deliver[0]
+                    goal_x, goal_y = next_goal[0], next_goal[1]
+                    
+                    # Check if we're already at the first priority goal
+                    if abs(self.x - goal_x) < 0.5 and abs(self.y - goal_y) < 0.5:
+                        # Pick up cargo at first priority goal
+                        self.has_cargo = True
+                        self.current_goal = next_goal
+                        self.delivery_mode = "DROPOFF"
+                        debug_log(f"Picked up cargo at goal ({goal_x}, {goal_y}) - priority goal")
+                        
+                        # Plan path to discharge dock
+                        discharge_dock = self.warehouse.discharge_dock
+                        if discharge_dock:
+                            path = self.astar_cached(current_pos, discharge_dock, allow_goals=True)
+                            if path and len(path) > 1:
+                                self.delivery_path = path[1:]
+                                self.delivery_path_index = 0
+                                debug_log(f"Planned path to discharge dock: {len(self.delivery_path)} steps")
+                                return False
+                            else:
+                                debug_log(f"Warning: No path from goal to discharge dock")
+                                return False
+                        else:
+                            debug_log(f"Warning: No discharge dock found")
+                            return False
+                    else:
+                        # Not at goal yet - plan path to first priority goal
+                        path = self.astar_cached(current_pos, next_goal, allow_goals=True)
                         if path and len(path) > 1:
                             self.delivery_path = path[1:]
                             self.delivery_path_index = 0
-                            debug_log(f"Planned path to goal {next_goal}: {len(self.delivery_path)} steps")
+                            # Calculate priority number (1-based, first goal is priority 1)
+                            # Priority = total initial goals - remaining goals + 1
+                            total_initial_goals = len(self.warehouse.goals) + len(self.goals_to_deliver) if self.warehouse else len(self.goals_to_deliver)
+                            priority = total_initial_goals - len(self.goals_to_deliver) + 1
+                            debug_log(f"Planned path to goal {next_goal} (priority {priority}): {len(self.delivery_path)} steps")
                             return False
                         else:
                             debug_log(f"Warning: No path to goal {next_goal}, removing from list")
@@ -497,14 +645,20 @@ class Robot:
                             
                             # Check if more goals to deliver
                             if self.goals_to_deliver:
-                                # Plan path to next goal
+                                # Plan path to next goal (first priority goal)
                                 current_pos = (int(self.x), int(self.y))
                                 next_goal = self.goals_to_deliver[0]
-                                path = astar(current_pos, next_goal, self.ogm, allow_goals=True)
+                                path = self.astar_cached(current_pos, next_goal, allow_goals=True)
                                 if path and len(path) > 1:
                                     self.delivery_path = path[1:]
                                     self.delivery_path_index = 0
-                                    debug_log(f"Planned path to next goal {next_goal}: {len(self.delivery_path)} steps")
+                                    total_initial_goals = len(self.warehouse.goals) + len(self.goals_to_deliver) if self.warehouse else len(self.goals_to_deliver)
+                                    priority = total_initial_goals - len(self.goals_to_deliver) + 1
+                                    debug_log(f"Planned path to next goal {next_goal} (priority {priority}): {len(self.delivery_path)} steps")
+                                    return False
+                                else:
+                                    debug_log(f"Warning: No path to next goal {next_goal}, removing from list")
+                                    self.goals_to_deliver.remove(next_goal)
                                     return False
                             else:
                                 # All goals delivered
@@ -532,7 +686,10 @@ class Robot:
                             dx = nx2 - nx
                             dy = ny2 - ny
                             self.rotate_towards(dx, dy)
-                        debug_log(f"Delivery: ({nx}, {ny}), {len(self.delivery_path) - self.delivery_path_index} steps remaining")
+                        # Only log every 10 steps or when near completion
+                        remaining = len(self.delivery_path) - self.delivery_path_index
+                        if remaining % 10 == 0 or remaining < 5:
+                            debug_log(f"Delivery: {remaining} steps remaining")
                         return True
         
         return False
@@ -569,11 +726,19 @@ class Robot:
         self.return_path = []
         self.return_path_index = 0
         
+        # Reset cached exploration completeness check
+        self.has_unknown_adjacent_cached = True  # Start with True, will be updated incrementally
+        self.last_unknown_check_time = 0
+        
         # Reset delivery state
         self.delivery_path = []
         self.delivery_path_index = 0
         self.delivery_mode = "PICKUP"
         self.goals_to_deliver = []
+        
+        # Reset path cache
+        self.path_cache = {}
+        self.path_cache_max_size = 100
         
         # Mark starting position as explored
         self.update_with_sensor()

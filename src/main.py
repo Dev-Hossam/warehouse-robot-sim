@@ -69,10 +69,11 @@ while running:
         # Autonomous mapping phase - robot explores using DFS coverage
         robot.explore_next(current_time)
         
-        # Periodic pose graph optimization
+        # Periodic pose graph optimization (reduced frequency from 4s to 8s, only when needed)
         frame_count = pygame.time.get_ticks() // (1000 // 60)
-        optimization_interval = 240  # Optimize every 240 frames (4 seconds at 60 FPS)
-        if frame_count % optimization_interval == 0:
+        optimization_interval = 480  # Optimize every 480 frames (8 seconds at 60 FPS, reduced from 240 frames/4s)
+        # Only optimize when needed (e.g., after loop closure detected)
+        if frame_count % optimization_interval == 0 and robot.loop_closure_detected:
             # Convert warehouse obstacles to format for optimization
             obstacles = []
             for obs_x, obs_y in warehouse.obstacles:
