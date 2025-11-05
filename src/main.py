@@ -1,5 +1,6 @@
 """
 Main entry point for the warehouse robot simulation.
+Implements frontier-based exploration with iSAM localization.
 """
 
 import pygame
@@ -17,15 +18,15 @@ pygame.init()
 
 # Create the display
 screen = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT))
-pygame.display.set_caption("Warehouse Robot Simulation - SLAM")
+pygame.display.set_caption("Warehouse Robot Simulation - Frontier-Based Exploration with iSAM")
 clock = pygame.time.Clock()
 
 # Initialize warehouse and robot
 debug_log("=" * 50)
-debug_log("INITIALIZING WAREHOUSE ROBOT SIMULATION WITH SLAM")
+debug_log("INITIALIZING WAREHOUSE ROBOT SIMULATION WITH FRONTIER-BASED EXPLORATION")
 debug_log("=" * 50)
 warehouse = Warehouse()
-robot = Robot(1, 1, warehouse=warehouse)  # Pass warehouse for position validation
+robot = Robot(1, 1, warehouse=warehouse)
 
 # Start autonomous mapping phase
 debug_log("")
@@ -51,8 +52,18 @@ while running:
     
     # Handle mapping phase or normal gameplay
     if robot.is_mapping:
-        # Autonomous mapping phase - robot explores automatically
-        robot.explore_next_cell(current_time)
+        # Autonomous mapping phase - robot explores using DFS coverage
+        robot.explore_next(current_time)
+        
+        # Periodic pose graph optimization
+        frame_count = pygame.time.get_ticks() // (1000 // 60)
+        optimization_interval = 240  # Optimize every 240 frames (4 seconds at 60 FPS)
+        if frame_count % optimization_interval == 0:
+            # Convert warehouse obstacles to format for optimization
+            obstacles = []
+            for obs_x, obs_y in warehouse.obstacles:
+                obstacles.append((obs_x, obs_y))
+            robot.isam.optimize_graph(obstacles, recent_nodes=10)
     else:
         # Normal gameplay - only allow manual control after mapping is complete
         if robot.mapping_complete:
@@ -98,44 +109,57 @@ while running:
     # Draw instructions and status
     font = pygame.font.Font(None, 24)
     if robot.is_mapping:
-        text = font.render("MAPPING IN PROGRESS... Robot exploring autonomously", True, RED)
+        text = font.render("DFS COVERAGE EXPLORATION IN PROGRESS...", True, RED)
         screen.blit(text, (10, 10))
+        
+        # Get exploration status
+        explored_count = len(robot.visited) if hasattr(robot, 'visited') else 0
+        total_free = len(warehouse.get_free_cells())
+        stack_size = len(robot.stack) if hasattr(robot, 'stack') else 0
+        
         mapping_status = font.render(
-            f"Cells explored: {len(robot.visited)} | Queue: {len(robot.exploration_queue)}",
+            f"Visited: {explored_count}/{total_free} | Stack: {stack_size} | Mode: {robot.exploration_mode}",
             True, BLACK
         )
         screen.blit(mapping_status, (10, 35))
         
-        # SLAM pose information
-        estimated_pose = robot.slam.get_estimated_pose()
-        uncertainty = robot.slam.get_uncertainty()
+        # iSAM pose information
+        estimated_pose = robot.isam.get_estimated_pose()
+        uncertainty = robot.isam.get_uncertainty()
         robot_pos = font.render(
             f"Actual: ({int(robot.x)}, {int(robot.y)}) | Est: ({estimated_pose[0]:.1f}, {estimated_pose[1]:.1f}) | Angle: {int(robot.rotation_angle)}°",
             True, BLACK
         )
         screen.blit(robot_pos, (10, 60))
         
-        slam_status = font.render(
+        isam_status = font.render(
             f"Uncertainty: {uncertainty[0]:.3f} | Loop Closure: {'DETECTED' if robot.loop_closure_detected else 'None'}",
             True, BLACK
         )
-        screen.blit(slam_status, (10, 85))
+        screen.blit(isam_status, (10, 85))
         
         # Show mapping progress
-        total_free = len(warehouse.get_free_cells())
-        progress = len(robot.visited) / total_free * 100 if total_free > 0 else 0
+        progress = explored_count / total_free * 100 if total_free > 0 else 0
         progress_text = font.render(
-            f"Mapping Progress: {progress:.1f}% ({len(robot.visited)}/{total_free} cells)",
+            f"Mapping Progress: {progress:.1f}% ({explored_count}/{total_free} cells)",
             True, BLACK
         )
         screen.blit(progress_text, (10, 110))
+        
+        # Show DFS status
+        if hasattr(robot, 'stack') and robot.stack:
+            dfs_text = font.render(
+                f"DFS Stack: {len(robot.stack)} cells | Backtracking when needed",
+                True, BLACK
+            )
+            screen.blit(dfs_text, (10, 135))
     else:
         text = font.render("Arrow Keys: Move | Space: Pickup | V: Drop | ESC: Quit", True, BLACK)
         screen.blit(text, (10, 10))
         
-        # SLAM pose information
-        estimated_pose = robot.slam.get_estimated_pose()
-        uncertainty = robot.slam.get_uncertainty()
+        # iSAM pose information
+        estimated_pose = robot.isam.get_estimated_pose()
+        uncertainty = robot.isam.get_uncertainty()
         robot_pos = font.render(
             f"Actual: ({int(robot.x)}, {int(robot.y)}) | Est: ({estimated_pose[0]:.1f}, {estimated_pose[1]:.1f}) | Cargo: {'Yes' if robot.has_cargo else 'No'} | Angle: {int(robot.rotation_angle)}°",
             True, BLACK
@@ -161,7 +185,7 @@ while running:
     legend_font = pygame.font.Font(None, 20)
     legend1 = legend_font.render("Blue circle = Actual robot position", True, BLACK)
     screen.blit(legend1, (10, legend_y))
-    legend2 = legend_font.render("Green circle = Estimated pose (SLAM)", True, BLACK)
+    legend2 = legend_font.render("Green circle = Estimated pose (iSAM)", True, BLACK)
     screen.blit(legend2, (10, legend_y + 20))
     legend3 = legend_font.render("Orange line = Pose error", True, BLACK)
     screen.blit(legend3, (10, legend_y + 40))
