@@ -17,14 +17,21 @@ from warehouse import Warehouse
 # Parse command-line arguments
 parser = argparse.ArgumentParser(description='Warehouse Robot Simulation')
 parser.add_argument('--algo', type=str, default='A*', 
-                    choices=['A*', 'astar', 'A-star', 'A_star'],
+                    choices=['A*', 'astar', 'A-star', 'A_star', 'dijkstra', 'Dijkstra', 
+                            'rrt', 'RRT', 'prm', 'PRM'],
                     help='Pathfinding algorithm to use (default: A*)')
 args = parser.parse_args()
 
-# Normalize algorithm name
-algorithm = args.algo.replace('*', 'star').replace('-', '').replace('_', '').lower()
-if algorithm == 'astar':
+# Normalize algorithm name (robot expects: 'A*', 'DIJKSTRA', 'RRT', 'PRM')
+algorithm = args.algo.replace('*', 'star').replace('-', '').replace('_', '').upper()
+if algorithm == 'ASTAR':
     algorithm = 'A*'
+elif algorithm == 'DIJKSTRA':
+    algorithm = 'DIJKSTRA'
+elif algorithm == 'RRT':
+    algorithm = 'RRT'
+elif algorithm == 'PRM':
+    algorithm = 'PRM'
 
 # Initialize pygame
 pygame.init()
@@ -40,7 +47,7 @@ debug_log(f"INITIALIZING WAREHOUSE ROBOT SIMULATION WITH DFS EXPLORATION")
 debug_log(f"Pathfinding Algorithm: {algorithm}")
 debug_log("=" * 50)
 warehouse = Warehouse()
-robot = Robot(1, 1, warehouse=warehouse)
+robot = Robot(1, 1, warehouse=warehouse, pathfinding_algorithm=algorithm)
 
 # Start autonomous mapping phase
 debug_log("")
