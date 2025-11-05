@@ -78,8 +78,9 @@ class SLAMSystem:
         self.estimated_theta = (self.estimated_theta + dtheta) % 360
         
         # Increase uncertainty (odometry accumulates error)
-        self.position_uncertainty += 0.05
-        self.orientation_uncertainty += 1.0
+        # Reduced uncertainty growth to slow down drift accumulation
+        self.position_uncertainty += 0.03  # Reduced from 0.05
+        self.orientation_uncertainty += 0.5  # Reduced from 1.0
         
         debug_print(f"Predicted pose: ({self.estimated_x:.3f}, {self.estimated_y:.3f}), "
                    f"theta={self.estimated_theta:.3f}°, uncertainty={self.position_uncertainty:.3f}")
@@ -264,7 +265,7 @@ class SLAMSystem:
         
         # Calculate pose correction (interpolate between current and matched pose)
         # This is a simplified correction - full SLAM would use more sophisticated methods
-        correction_factor = 0.7  # 70% correction for better error correction
+        correction_factor = 0.85  # 85% correction for better error correction
         
         dx = matched_pose[0] - current_pose[0]
         dy = matched_pose[1] - current_pose[1]

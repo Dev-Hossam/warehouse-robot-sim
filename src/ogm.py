@@ -146,9 +146,12 @@ class OccupancyGridMap:
         """Mark a cell as explored (visited by robot)."""
         if 0 <= x < self.width and 0 <= y < self.height:
             self.explored_cells.add((x, y))
-            # Mark as free if not already obstacle
-            if (x, y) not in self.obstacles:
-                self.mark_free(x, y)
+            # Mark as free - if it was previously marked as obstacle, correct it
+            # This ensures OGM is corrected when we successfully visit a cell
+            if (x, y) in self.obstacles:
+                # Remove from obstacles set if we successfully visited it
+                self.obstacles.discard((x, y))
+            self.mark_free(x, y)
     
     def is_explored(self, x, y):
         """Check if a cell has been explored."""
