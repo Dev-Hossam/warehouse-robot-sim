@@ -146,8 +146,16 @@ while running:
         )
         screen.blit(progress_text, (10, 110))
         
-        # Show DFS status
-        if hasattr(robot, 'stack') and robot.stack:
+        # Show DFS status or return status
+        if robot.exploration_mode == "RETURN_TO_START":
+            if hasattr(robot, 'return_path') and robot.return_path:
+                remaining = len(robot.return_path) - robot.return_path_index
+                return_text = font.render(
+                    f"RETURNING TO START: {remaining} steps remaining",
+                    True, GREEN
+                )
+                screen.blit(return_text, (10, 135))
+        elif hasattr(robot, 'stack') and robot.stack:
             dfs_text = font.render(
                 f"DFS Stack: {len(robot.stack)} cells | Backtracking when needed",
                 True, BLACK

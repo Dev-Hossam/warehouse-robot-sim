@@ -89,11 +89,15 @@ class Robot:
         self.last_node_angle = 0
         
         # Exploration state
-        self.exploration_mode = "EXPLORE"  # EXPLORE or PLAN_TO_GOALS
+        self.exploration_mode = "EXPLORE"  # EXPLORE, RETURN_TO_START, or PLAN_TO_GOALS
         
         # DFS coverage: stack-based backtracking
         self.visited = set()  # Set of (x, y) visited cells
         self.stack = []  # Stack for backtracking: [(x, y), ...]
+        
+        # Return to start after exploration
+        self.return_path = []  # Path back to start position
+        self.return_path_index = 0
         
         debug_log(f"Robot initialized at ({x}, {y}) with DFS coverage exploration")
     
@@ -133,7 +137,15 @@ class Robot:
             robot_rc = (int(self.y), int(self.x))  # (row, col)
             self.lidar.update_ogm_with_rays(robot_rc, self.ogm, self.warehouse)
             # Mark current cell as explored
-            self.ogm.mark_explored(int(self.x), int(self.y))
+            current_x, current_y = int(self.x), int(self.y)
+            self.ogm.mark_explored(current_x, current_y)
+            
+            # Check if we're at a goal position and mark it
+            for goal in self.warehouse.goals:
+                goal_x, goal_y = goal[0], goal[1]
+                if current_x == goal_x and current_y == goal_y:
+                    self.ogm.mark_goal(current_x, current_y)
+                    debug_log(f"Reached goal at ({current_x}, {current_y})")
     
     def can_move_to(self, new_x, new_y):
         """Check if robot can move to a new position."""
@@ -287,7 +299,26 @@ class Robot:
         
         return None  # No path found
     
-    
+    def plan_return_to_start(self):
+        """Plan path back to starting position after exploration is complete."""
+        current_pos = (int(self.y), int(self.x))  # (row, col)
+        start_pos = (int(self.start_y), int(self.start_x))  # (row, col)
+        
+        # Plan path using A*
+        path = self.astar(current_pos, start_pos)
+        
+        if path and len(path) > 1:
+            # Convert path from (row, col) to (x, y)
+            self.return_path = []
+            for r, c in path[1:]:  # Skip first cell (current position)
+                self.return_path.append((c, r))  # Convert (row, col) to (x, y)
+            self.return_path_index = 0
+            debug_log(f"Planned return path to start: {len(self.return_path)} steps")
+        else:
+            debug_log("Warning: Could not plan path to start position")
+            self.return_path = []
+            self.return_path_index = 0
+
     def explore_next(self, current_time):
         """Execute one step of DFS coverage exploration."""
         if not self.is_mapping:
@@ -345,12 +376,13 @@ class Robot:
                         debug_log(f"DFS: Backtrack failed to ({px}, {py}), trying next")
                         return False
                 else:
-                    # Stack empty - check if exploration is complete
-                    # Check if any FREE cell has an UNKNOWN neighbor
+                    # Stack empty - check if exploration is complete (100% parsed)
+                    # Check if any FREE or GOAL cell has an UNKNOWN neighbor
                     has_unknown_adjacent = False
                     for y in range(WAREHOUSE_HEIGHT):
                         for x in range(WAREHOUSE_WIDTH):
-                            if self.ogm.get_cell_state(x, y) == FREE:
+                            cell_state = self.ogm.get_cell_state(x, y)
+                            if cell_state == FREE or cell_state == GOAL:
                                 # Check if any neighbor is UNKNOWN
                                 for nx, ny in self.neighbors4(x, y):
                                     if self.ogm.is_unknown(nx, ny):
@@ -362,24 +394,57 @@ class Robot:
                             break
                     
                     if not has_unknown_adjacent:
-                        # No UNKNOWN cells adjacent to FREE cells - exploration complete
-                        debug_log("Exploration complete! No UNKNOWN cells adjacent to FREE cells.")
-                        self.exploration_mode = "PLAN_TO_GOALS"
+                        # No UNKNOWN cells adjacent to FREE/GOAL cells - 100% exploration complete!
+                        debug_log("=" * 50)
+                        debug_log("EXPLORATION COMPLETE! 100% map parsed!")
+                        debug_log(f"Visited: {len(self.visited)} cells")
+                        debug_log(f"Goals discovered: {len(self.ogm.goals)}")
+                        debug_log("Breaking out and returning to start position...")
+                        debug_log("=" * 50)
+                        
+                        # Break out: switch to return mode
+                        self.exploration_mode = "RETURN_TO_START"
                         self.mapping_complete = True
-                        return False
+                        # Plan path back to start
+                        self.plan_return_to_start()
+                        return True
                     else:
                         # Still have unknown cells but no path to them
                         debug_log("DFS: Stack empty but unknown cells remain - may be unreachable")
                         return False
         
-        elif self.exploration_mode == "PLAN_TO_GOALS":
-            # After exploration, plan to goals
-            if not self.warehouse or not self.warehouse.goals:
+        elif self.exploration_mode == "RETURN_TO_START":
+            # After 100% exploration, return to starting position
+            if not hasattr(self, 'return_path') or not self.return_path:
+                # Plan return path if not already planned
+                self.plan_return_to_start()
                 return False
             
-            # For now, just mark as complete
-            # TODO: Implement goal planning after exploration
-            return False
+            # Execute return path
+            if self.return_path_index < len(self.return_path):
+                next_cell = self.return_path[self.return_path_index]
+                nx, ny = next_cell
+                
+                if current_time - self.last_move_time >= self.move_cooldown:
+                    if self.move_to(nx, ny, current_time):
+                        self.return_path_index += 1
+                        # Rotate towards direction
+                        if self.return_path_index < len(self.return_path):
+                            nx2, ny2 = self.return_path[self.return_path_index]
+                            dx = nx2 - nx
+                            dy = ny2 - ny
+                            self.rotate_towards(dx, dy)
+                        debug_log(f"Returning to start: ({nx}, {ny}), {len(self.return_path) - self.return_path_index} steps remaining")
+                        return True
+            else:
+                # Reached start position
+                if abs(self.x - self.start_x) < 0.5 and abs(self.y - self.start_y) < 0.5:
+                    debug_log("=" * 50)
+                    debug_log(f"RETURNED TO START POSITION ({int(self.start_x)}, {int(self.start_y)})")
+                    debug_log("Exploration mission complete!")
+                    debug_log("=" * 50)
+                    self.is_mapping = False
+                    return False
         
         return False
     
@@ -412,6 +477,8 @@ class Robot:
         # Reset DFS state
         self.visited = set()
         self.stack = []
+        self.return_path = []
+        self.return_path_index = 0
         
         # Mark starting position as explored
         self.update_with_sensor()
