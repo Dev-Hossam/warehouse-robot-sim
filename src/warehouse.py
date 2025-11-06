@@ -2,6 +2,7 @@
 Warehouse module for the warehouse robot simulation.
 """
 
+import math
 import pygame
 from constants import (
     WAREHOUSE_WIDTH, WAREHOUSE_HEIGHT, GRID_SIZE, 
@@ -28,6 +29,8 @@ class Warehouse:
         self.width = WAREHOUSE_WIDTH
         self.height = WAREHOUSE_HEIGHT
         self.map_name = map_name
+        self.dynamic_obstacles = []  # List of dynamic obstacles
+        self.dynamic_obstacles_spawned = False  # Flag to track spawning
         debug_log(f"Creating warehouse layout: {map_name}...")
         self.create_maze_layout(map_name)
         self.create_docks_and_goals(map_name)
@@ -121,6 +124,33 @@ class Warehouse:
                 (5, 10), (11, 10), (17, 10), (23, 10),
             ]
             for x, y in corner_obstacles:
+                if x < WAREHOUSE_WIDTH and y < WAREHOUSE_HEIGHT:
+                    self.obstacles.add((x, y))
+        
+        elif map_name == 'map4':
+            # Map4 layout - similar to map1 but with different structure
+            # Create internal maze structure with wider paths
+            # Horizontal corridors
+            for y in [4, 8, 12]:
+                if y < WAREHOUSE_HEIGHT:
+                    for x in range(2, WAREHOUSE_WIDTH - 2):
+                        if x % 8 not in [0, 1]:  # Wider gaps for vertical passages
+                            self.obstacles.add((x, y))
+            
+            # Vertical corridors (wider spacing)
+            for x in [7, 15]:
+                if x < WAREHOUSE_WIDTH:
+                    for y in range(2, WAREHOUSE_HEIGHT - 2):
+                        if y % 6 not in [0, 1]:  # Wider gaps for horizontal passages
+                            self.obstacles.add((x, y))
+            
+            # Add strategic obstacles
+            maze_obstacles = [
+                (4, 6), (10, 6), (18, 6),
+                (4, 10), (12, 10), (20, 10),
+                (6, 14), (14, 14), (22, 14),
+            ]
+            for x, y in maze_obstacles:
                 if x < WAREHOUSE_WIDTH and y < WAREHOUSE_HEIGHT:
                     self.obstacles.add((x, y))
     
@@ -266,6 +296,66 @@ class Warehouse:
         debug_log(f"Generated {len(goals)} random goals: {goals}")
         return goals
     
+    def spawn_dynamic_obstacles(self, num_obstacles=8):
+        """
+        Spawn dynamic obstacles (workers and forklifts) at random free positions.
+        Called when robot transitions to DELIVER_GOALS mode.
+        
+        Args:
+            num_obstacles: Total number of obstacles to spawn
+        """
+        if self.dynamic_obstacles_spawned:
+            return  # Already spawned
+        
+        import random
+        from dynamic_obstacles import Worker, Forklift
+        
+        free_cells = self.get_free_cells()
+        
+        # Remove start position, loading dock, discharge dock, and goals from spawn locations
+        excluded_positions = {self.discharge_dock, self.loading_dock}
+        if self.goals:
+            excluded_positions.update(self.goals)
+        
+        free_cells = [cell for cell in free_cells if cell not in excluded_positions]
+        
+        if len(free_cells) < num_obstacles:
+            debug_log(f"Warning: Not enough free cells ({len(free_cells)}) for {num_obstacles} obstacles")
+            num_obstacles = len(free_cells)
+        
+        # Randomly assign types (worker or forklift)
+        obstacle_types = []
+        for i in range(num_obstacles):
+            obstacle_types.append(random.choice(['worker', 'forklift']))
+        
+        # Spawn obstacles at random positions
+        spawned_positions = set()
+        for i, obs_type in enumerate(obstacle_types):
+            max_attempts = 100
+            attempts = 0
+            while attempts < max_attempts:
+                candidate = random.choice(free_cells)
+                if candidate not in spawned_positions:
+                    # Create obstacle
+                    if obs_type == 'worker':
+                        obstacle = Worker(candidate[0], candidate[1], warehouse=self)
+                    else:  # forklift
+                        obstacle = Forklift(candidate[0], candidate[1], warehouse=self)
+                    
+                    self.dynamic_obstacles.append(obstacle)
+                    spawned_positions.add(candidate)
+                    debug_log(f"Spawned {obs_type} at {candidate}")
+                    break
+                attempts += 1
+        
+        self.dynamic_obstacles_spawned = True
+        debug_log(f"Spawned {len(self.dynamic_obstacles)} dynamic obstacles ({obstacle_types.count('worker')} workers, {obstacle_types.count('forklift')} forklifts)")
+    
+    def update_dynamic_obstacles(self, current_time):
+        """Update all dynamic obstacles."""
+        for obstacle in self.dynamic_obstacles:
+            obstacle.update(current_time, other_obstacles=self.dynamic_obstacles)
+    
     def draw(self, surface, robot):
         """Draw the warehouse grid, obstacles, goals, and docks."""
         from constants import SCREEN_WIDTH, SCREEN_HEIGHT, WHITE, DARK_GRAY
@@ -336,3 +426,35 @@ class Warehouse:
                 y = row * GRID_SIZE
                 pygame.draw.rect(surface, YELLOW, (x + 1, y + 1, GRID_SIZE - 2, GRID_SIZE - 2))
                 pygame.draw.rect(surface, DARK_GRAY, (x + 1, y + 1, GRID_SIZE - 2, GRID_SIZE - 2), 1)
+        
+        # Draw dynamic obstacles with trajectories and velocity vectors
+        if robot and robot.local_mapper:
+            # Get dynamic obstacles in local map radius
+            robot_pos = (robot.x, robot.y)
+            dynamic_obstacles_info = robot.local_mapper.get_dynamic_obstacles_in_radius(robot_pos, radius=robot.local_mapper.radius)
+            
+            for obstacle_id, current_pos, predicted_pos in dynamic_obstacles_info:
+                # Draw velocity vector (arrow from current to predicted position)
+                if predicted_pos:
+                    curr_x = int(current_pos[0] * GRID_SIZE + GRID_SIZE // 2)
+                    curr_y = int(current_pos[1] * GRID_SIZE + GRID_SIZE // 2)
+                    pred_x = int(predicted_pos[0] * GRID_SIZE + GRID_SIZE // 2)
+                    pred_y = int(predicted_pos[1] * GRID_SIZE + GRID_SIZE // 2)
+                    
+                    # Draw predicted trajectory line (dotted)
+                    pygame.draw.line(surface, (255, 200, 0), (curr_x, curr_y), (pred_x, pred_y), 2)
+                    
+                    # Draw arrow head
+                    if abs(pred_x - curr_x) > 2 or abs(pred_y - curr_y) > 2:
+                        angle = math.atan2(pred_y - curr_y, pred_x - curr_x)
+                        arrow_size = 6
+                        head_x1 = pred_x - arrow_size * math.cos(angle - math.pi / 6)
+                        head_y1 = pred_y - arrow_size * math.sin(angle - math.pi / 6)
+                        head_x2 = pred_x - arrow_size * math.cos(angle + math.pi / 6)
+                        head_y2 = pred_y - arrow_size * math.sin(angle + math.pi / 6)
+                        pygame.draw.polygon(surface, (255, 200, 0), 
+                                          [(pred_x, pred_y), (int(head_x1), int(head_y1)), (int(head_x2), int(head_y2))])
+        
+        # Draw dynamic obstacles
+        for obstacle in self.dynamic_obstacles:
+            obstacle.draw(surface)

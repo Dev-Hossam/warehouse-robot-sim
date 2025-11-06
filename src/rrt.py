@@ -212,19 +212,22 @@ def rrt(start, target, ogm, allow_goals=True, max_iterations=2000, step_size=1, 
         # Step towards random point
         new_x, new_y = step_towards(nearest[0], nearest[1], rand_x, rand_y, step_size)
         
+        # Ensure new point is 4-connected (Manhattan distance = 1 for step_size=1)
+        if step_size == 1:
+            dx = new_x - nearest[0]
+            dy = new_y - nearest[1]
+            if abs(dx) + abs(dy) != 1:
+                # Not adjacent, skip
+                continue
+        
         # Check if new point is valid and traversable
         if not is_traversable(new_x, new_y, ogm, allow_goals):
             continue
         
-        # Check if path from nearest to new point is clear (grid-based check)
-        # Only check if step_size > 1, otherwise adjacent check is sufficient
-        if step_size > 1:
-            if not is_path_clear_grid(nearest[0], nearest[1], new_x, new_y, ogm, allow_goals):
-                continue
-        else:
-            # For step_size=1, just check if adjacent
-            if abs(new_x - nearest[0]) + abs(new_y - nearest[1]) != 1:
-                continue
+        # Always check if path from nearest to new point is clear (even for step_size=1)
+        # This ensures we don't skip over obstacles
+        if not is_path_clear_grid(nearest[0], nearest[1], new_x, new_y, ogm, allow_goals):
+            continue
         
         # Add new node to tree
         new_node = (new_x, new_y)
@@ -240,20 +243,63 @@ def rrt(start, target, ogm, allow_goals=True, max_iterations=2000, step_size=1, 
             # Check if direct path to target is clear
             if is_path_clear_grid(new_x, new_y, tx, ty, ogm, allow_goals):
                 # Reconstruct path from start to target
+                # Build path from start to new_node, then to target
                 path = []
-                node = (tx, ty)
-                path.append(node)
                 
-                # Trace back to start
+                # Trace back from new_node to start
                 current = new_node
+                path_back = [current]
                 while current is not None:
-                    path.append(current)
-                    current = tree.get(current)
+                    parent = tree.get(current)
+                    if parent is None:
+                        # Reached start node (start has no parent)
+                        break
+                    # Verify step from parent to current is valid
+                    if not is_path_clear_grid(parent[0], parent[1], current[0], current[1], ogm, allow_goals):
+                        debug_print(f"RRT: Invalid step in tree from {parent} to {current}, continuing search...")
+                        break
+                    path_back.append(parent)
+                    current = parent
                 
-                path.reverse()
+                # Reverse to get path from start to new_node
+                path_back.reverse()
+                path = path_back
+                
+                # Ensure start is in path (should be first element)
+                if not path or path[0] != start:
+                    debug_print(f"RRT: Path doesn't start at start node, continuing search...")
+                    continue
+                
+                # Add target if path is valid so far
+                if path and is_path_clear_grid(path[-1][0], path[-1][1], tx, ty, ogm, allow_goals):
+                    path.append((tx, ty))
+                else:
+                    debug_print(f"RRT: Cannot connect path to target, continuing search...")
+                    continue
+                
+                # Validate the entire path before smoothing
+                if not _validate_path(path, ogm, allow_goals):
+                    debug_print(f"RRT: Reconstructed path is invalid, continuing search...")
+                    continue
                 
                 # Smooth the path to reduce unnecessary waypoints
                 path = smooth_path(path, ogm, allow_goals)
+                
+                # Validate smoothed path
+                if not _validate_path(path, ogm, allow_goals):
+                    debug_print(f"RRT: Smoothed path is invalid, using unsmoothed path")
+                    # Reconstruct unsmoothed path
+                    path = []
+                    current = new_node
+                    path_back = [current]
+                    while current is not None:
+                        parent = tree.get(current)
+                        if parent is None:
+                            break
+                        path_back.append(parent)
+                        current = parent
+                    path_back.reverse()
+                    path = path_back + [(tx, ty)]
                 
                 debug_print(f"RRT path found: {len(path)} steps from ({sx}, {sy}) to ({tx}, {ty}) in {iterations} iterations")
                 return path
@@ -262,56 +308,154 @@ def rrt(start, target, ogm, allow_goals=True, max_iterations=2000, step_size=1, 
     # Fallback: try A* if RRT fails
     debug_print("RRT: Falling back to A* for pathfinding")
     from astar import astar
-    return astar(start, target, ogm, allow_goals)
+    fallback_path = astar(start, target, ogm, allow_goals)
+    if fallback_path and _validate_path(fallback_path, ogm, allow_goals):
+        return fallback_path
+    return None
+
+
+def _validate_path(path, ogm, allow_goals=True):
+    """Validate that all cells in a path are traversable and path is valid."""
+    if not path or len(path) < 2:
+        return True
+    
+    # Check all cells are traversable
+    for x, y in path:
+        if not is_traversable(x, y, ogm, allow_goals):
+            return False
+    
+    # Check all consecutive cells are either adjacent (4-connected) or have a clear path
+    for i in range(len(path) - 1):
+        x1, y1 = path[i]
+        x2, y2 = path[i + 1]
+        dx = abs(x2 - x1)
+        dy = abs(y2 - y1)
+        # Must be 4-connected (Manhattan distance = 1) or have a clear path
+        if dx + dy != 1:
+            # Check if there's a valid grid path between them
+            if not is_path_clear_grid(x1, y1, x2, y2, ogm, allow_goals):
+                return False
+    
+    return True
 
 
 def is_path_clear_grid(x1, y1, x2, y2, ogm, allow_goals=True):
     """Check if grid-based path between two points is clear (4-connected grid path)."""
-    # Use grid-based path (4-connected neighbors only)
-    x, y = x1, y1
-    while x != x2 or y != y2:
-        if not is_traversable(x, y, ogm, allow_goals):
-            return False
-        
-        # Move one step towards target (grid-based)
-        if x < x2:
-            x += 1
-        elif x > x2:
-            x -= 1
-        elif y < y2:
-            y += 1
-        elif y > y2:
-            y -= 1
-        else:
-            break
+    # For 4-connected grid movement, check if there's a valid Manhattan path
+    # Try both L-shaped paths: horizontal-then-vertical and vertical-then-horizontal
+    x0, y0 = int(x1), int(y1)
+    x_end, y_end = int(x2), int(y2)
     
-    # Check final cell
-    return is_traversable(x2, y2, ogm, allow_goals)
+    # Check start and end cells
+    if not is_traversable(x0, y0, ogm, allow_goals) or not is_traversable(x_end, y_end, ogm, allow_goals):
+        return False
+    
+    # If start and end are the same, path is clear
+    if x0 == x_end and y0 == y_end:
+        return True
+    
+    # Try path 1: Move horizontally first, then vertically
+    x, y = x0, y0
+    path1_clear = True
+    
+    # Move in X direction first
+    while x != x_end:
+        if not is_traversable(x, y, ogm, allow_goals):
+            path1_clear = False
+            break
+        if x < x_end:
+            x += 1
+        else:
+            x -= 1
+    
+    if path1_clear:
+        # Then move in Y direction
+        while y != y_end:
+            if not is_traversable(x, y, ogm, allow_goals):
+                path1_clear = False
+                break
+            if y < y_end:
+                y += 1
+            else:
+                y -= 1
+    
+    if path1_clear:
+        return True
+    
+    # Try path 2: Move vertically first, then horizontally
+    x, y = x0, y0
+    path2_clear = True
+    
+    # Move in Y direction first
+    while y != y_end:
+        if not is_traversable(x, y, ogm, allow_goals):
+            path2_clear = False
+            break
+        if y < y_end:
+            y += 1
+        else:
+            y -= 1
+    
+    if path2_clear:
+        # Then move in X direction
+        while x != x_end:
+            if not is_traversable(x, y, ogm, allow_goals):
+                path2_clear = False
+                break
+            if x < x_end:
+                x += 1
+            else:
+                x -= 1
+    
+    return path2_clear
 
 
 def smooth_path(path, ogm, allow_goals=True):
-    """Smooth RRT path by removing unnecessary waypoints."""
+    """Smooth RRT path by removing unnecessary waypoints, ensuring path remains valid."""
     if len(path) <= 2:
         return path
     
+    # More conservative smoothing: only remove waypoints if we can create a valid 4-connected path
     smoothed = [path[0]]
     i = 0
     
     while i < len(path) - 1:
-        # Try to connect current point to points further ahead
-        j = len(path) - 1
+        # Try to connect current point to points further ahead (but not too far)
+        # Limit search to next 5 points to avoid creating long invalid segments
+        max_skip = min(5, len(path) - i - 1)
+        found_skip = False
+        
+        # Start from furthest point within max_skip and work backwards
+        j = min(i + max_skip, len(path) - 1)
         while j > i + 1:
-            if is_path_clear_grid(path[i][0], path[i][1], path[j][0], path[j][1], ogm, allow_goals):
-                # Can skip intermediate points
-                smoothed.append(path[j])
-                i = j
-                break
+            # Check if we can skip from i to j
+            # First check if cells are close enough (within reasonable distance)
+            dx = abs(path[j][0] - path[i][0])
+            dy = abs(path[j][1] - path[i][1])
+            manhattan_dist = dx + dy
+            
+            # Only try to skip if Manhattan distance is reasonable (not too far)
+            if manhattan_dist <= 10:
+                if is_path_clear_grid(path[i][0], path[i][1], path[j][0], path[j][1], ogm, allow_goals):
+                    # Verify the skip doesn't create an invalid path
+                    test_path = [path[i], path[j]]
+                    if _validate_path(test_path, ogm, allow_goals):
+                        # Can skip intermediate points
+                        smoothed.append(path[j])
+                        i = j
+                        found_skip = True
+                        break
             j -= 1
         
-        if j == i + 1:
+        if not found_skip:
             # Can't skip, add next point
             smoothed.append(path[i + 1])
             i += 1
+    
+    # Final validation of smoothed path - ensure all consecutive points are valid
+    if not _validate_path(smoothed, ogm, allow_goals):
+        debug_print("RRT: Smoothed path failed validation, returning original path")
+        return path
     
     return smoothed
 

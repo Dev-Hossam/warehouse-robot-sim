@@ -21,7 +21,7 @@ parser.add_argument('--algo', type=str, default='A*',
                             'rrt', 'RRT', 'prm', 'PRM'],
                     help='Pathfinding algorithm to use (default: A*)')
 parser.add_argument('--map', type=str, default='map1',
-                    choices=['map1', 'map2', 'map3'],
+                    choices=['map1', 'map2', 'map3', 'map4'],
                     help='Map configuration to use (default: map1)')
 args = parser.parse_args()
 
@@ -75,8 +75,23 @@ while running:
     # Update robot rotation
     robot.update_rotation(current_time)
     
+    # Spawn dynamic obstacles for map4 when robot enters DELIVER_GOALS mode
+    if robot.exploration_mode == "DELIVER_GOALS" and warehouse.map_name == 'map4':
+        if not warehouse.dynamic_obstacles_spawned:
+            warehouse.spawn_dynamic_obstacles(num_obstacles=8)
+    
+    # Update dynamic obstacles (only if spawned)
+    if warehouse.dynamic_obstacles_spawned:
+        warehouse.update_dynamic_obstacles(current_time)
+    
+    # Update local map with dynamic obstacles and apply temporal decay
+    robot.update_local_map_with_dynamics(current_time)
+    
     # Handle mapping phase or normal gameplay
     if robot.is_mapping:
+        # Check if path needs replanning due to dynamic obstacles
+        robot.replan_if_needed(current_time)
+        
         # Autonomous mapping phase - robot explores using DFS coverage
         robot.explore_next(current_time)
         
@@ -93,6 +108,9 @@ while running:
     else:
         # Normal gameplay - only allow manual control after mapping is complete
         if robot.mapping_complete:
+            # Check if path needs replanning due to dynamic obstacles
+            robot.replan_if_needed(current_time)
+            
             # Handle continuous input
             keys = pygame.key.get_pressed()
             robot.handle_input(keys, warehouse, current_time)

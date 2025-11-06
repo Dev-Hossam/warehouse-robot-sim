@@ -15,6 +15,7 @@ from astar import astar, plan_multi_goal_path
 from dijkstra import dijkstra
 from rrt import rrt
 from prm import prm
+from local_mapper import LocalMapper, LOCAL_DYNAMIC_OCCUPIED, DynamicObstacleTracker
 
 DEBUG = True
 
@@ -67,7 +68,7 @@ class Robot:
         self.current_goal = None
         self.has_cargo = False
         self.last_move_time = 0
-        self.move_cooldown = 1  # milliseconds between moves (increased speed from 50ms to 25ms)
+        self.move_cooldown = 100  # milliseconds between moves (increased speed from 50ms to 25ms)
         self.last_action_time = 0
         self.action_cooldown = 200  # milliseconds between actions (reduced from 300ms)
         self.score = 0
@@ -94,6 +95,9 @@ class Robot:
         
         # Initialize grid ray casting sensor
         self.lidar = LidarSensor(max_range=8)
+        
+        # Initialize local mapper
+        self.local_mapper = LocalMapper(radius=12, decay_half_life=2.0)
         
         # Initialize iSAM system
         self.isam = ISAM(initial_x=x, initial_y=y, initial_theta=0)
@@ -132,6 +136,11 @@ class Robot:
         
         # Path visualization
         self.current_path = []  # Current planned path for visualization
+        
+        # Replanning protection
+        self.replan_counter = 0  # Counter to prevent infinite replanning loops
+        self.last_replan_time = 0  # Time of last replanning
+        self.max_replans_per_second = 5  # Maximum replans per second
         
         # Statistics tracking
         self.statistics = {
@@ -188,6 +197,11 @@ class Robot:
             current_x, current_y = int(self.x), int(self.y)
             self.ogm.mark_explored(current_x, current_y)
             
+            # Update local map from global OGM
+            if self.local_mapper:
+                robot_pos = (self.x, self.y)
+                self.local_mapper.update_from_global_ogm(robot_pos, self.ogm, self.warehouse)
+            
             # Update cached unknown check incrementally
             if hasattr(self, 'has_unknown_adjacent_cached'):
                 if not self.check_unknown_adjacent_incremental(current_x, current_y):
@@ -203,6 +217,23 @@ class Robot:
                     self.ogm.mark_goal(current_x, current_y)
                     debug_log(f"Reached goal at ({current_x}, {current_y})")
     
+    def update_local_map_with_dynamics(self, current_time):
+        """
+        Update local map with dynamic obstacle positions and apply temporal decay.
+        
+        Args:
+            current_time: Current timestamp in milliseconds
+        """
+        if not self.local_mapper or not self.warehouse:
+            return
+        
+        # Update dynamic obstacles if they exist
+        if hasattr(self.warehouse, 'dynamic_obstacles') and self.warehouse.dynamic_obstacles:
+            self.local_mapper.update_dynamic_obstacles(self.warehouse.dynamic_obstacles, current_time)
+        
+        # Apply temporal decay
+        self.local_mapper.decay_observations(current_time)
+    
     def can_move_to(self, new_x, new_y):
         """Check if robot can move to a new position."""
         # Check bounds
@@ -216,6 +247,11 @@ class Robot:
         # Check OGM obstacle
         if self.ogm and self.ogm.is_obstacle(int(new_x), int(new_y)):
             return False
+        
+        # Check local map for dynamic obstacles and predicted positions
+        if self.local_mapper:
+            if not self.local_mapper.is_traversable(int(new_x), int(new_y), allow_goals=True):
+                return False
         
         return True
     
@@ -332,10 +368,200 @@ class Robot:
         debug_log("Exploration validation passed - no UNKNOWN cells adjacent to FREE/GOAL cells")
         return True
     
+    def check_path_validity(self, path):
+        """
+        Check if a path is valid against the local map (dynamic obstacles).
+        
+        Args:
+            path: List of (x, y) tuples representing the path
+            
+        Returns:
+            (is_valid, blocking_cells): Tuple of (bool, list of blocking cell positions)
+        """
+        if not path or not self.local_mapper:
+            return (True, [])
+        
+        blocking_cells = []
+        
+        for x, y in path:
+            # Check if cell is traversable in local map
+            if not self.local_mapper.is_traversable(int(x), int(y), allow_goals=True):
+                blocking_cells.append((int(x), int(y)))
+        
+        is_valid = len(blocking_cells) == 0
+        return (is_valid, blocking_cells)
+    
+    def replan_if_needed(self, current_time):
+        """
+        Check if current path is valid and replan if needed.
+        Called before executing next path step.
+        
+        Args:
+            current_time: Current timestamp in milliseconds
+            
+        Returns:
+            True if replanning occurred, False otherwise
+        """
+        # Update local map with dynamic obstacles
+        self.update_local_map_with_dynamics(current_time)
+        
+        # Rate limiting: prevent too many replans in a short time
+        time_since_last_replan = current_time - self.last_replan_time
+        if time_since_last_replan < 1000.0 / self.max_replans_per_second:  # Convert to ms
+            # Too soon to replan again, skip
+            return False
+        
+        # Reset counter if enough time has passed
+        if time_since_last_replan > 2000:  # 2 seconds
+            self.replan_counter = 0
+        
+        # Check current path validity
+        if hasattr(self, 'delivery_path') and self.delivery_path:
+            is_valid, blocking_cells = self.check_path_validity(self.delivery_path)
+            if not is_valid:
+                # Increment replan counter
+                self.replan_counter += 1
+                
+                # Prevent infinite loops: if we've replanned too many times, wait a bit
+                if self.replan_counter > 10:
+                    debug_log(f"Too many replans ({self.replan_counter}), waiting before next attempt...")
+                    return False
+                
+                # Only show first few blocking cells in log to avoid spam
+                blocking_preview = blocking_cells[:5] if len(blocking_cells) > 5 else blocking_cells
+                debug_log(f"Path blocked by dynamic obstacles at {blocking_preview}... (total: {len(blocking_cells)} cells, attempt {self.replan_counter})")
+                
+                # Replan from current position
+                current_pos = (int(self.x), int(self.y))
+                
+                # Determine target based on delivery mode
+                if self.delivery_mode == "PICKUP" and self.goals_to_deliver:
+                    target = self.goals_to_deliver[0]
+                elif self.delivery_mode == "DROPOFF" and self.warehouse and self.warehouse.discharge_dock:
+                    target = self.warehouse.discharge_dock
+                else:
+                    return False
+                
+                # Clear path cache for this route to force fresh pathfinding
+                cache_key = (current_pos, target, True, self.pathfinding_algorithm)
+                if cache_key in self.path_cache:
+                    del self.path_cache[cache_key]
+                
+                # Replan path
+                path = self.pathfind_cached(current_pos, target, allow_goals=True)
+                if path and len(path) > 1:
+                    # Validate new path before accepting it
+                    is_valid, new_blocking = self.check_path_validity(path)
+                    if is_valid:
+                        self.delivery_path = path[1:]
+                        self.delivery_path_index = 0
+                        self.last_replan_time = current_time
+                        self.replan_counter = 0  # Reset counter on successful replan
+                        debug_log(f"Successfully replanned path: {len(path)} steps")
+                        return True
+                    else:
+                        # New path is also blocked, but accept it anyway (will replan again if needed)
+                        self.delivery_path = path[1:]
+                        self.delivery_path_index = 0
+                        self.last_replan_time = current_time
+                        debug_log(f"Replanned path still has {len(new_blocking)} blocking cells, but accepting it")
+                        return True
+                else:
+                    # Pathfinding failed, increment counter
+                    debug_log(f"Pathfinding failed, no path found from {current_pos} to {target}")
+                    self.last_replan_time = current_time
+                    return False
+        
+        # Check return path validity
+        if hasattr(self, 'return_path') and self.return_path:
+            is_valid, blocking_cells = self.check_path_validity(self.return_path)
+            if not is_valid:
+                debug_log(f"Return path blocked by dynamic obstacles at {blocking_cells}, replanning...")
+                # Replan return path
+                self.plan_return_to_start()
+                return True
+        
+        return False
+    
+    def _integrated_pathfind(self, start, target, allow_goals=True):
+        """
+        Integrated pathfinding that checks both global OGM and local mapper.
+        Creates a custom traversability function that considers dynamic obstacles.
+        
+        Args:
+            start: (x, y) starting position
+            target: (x, y) target position
+            allow_goals: If True, GOAL cells are traversable
+            
+        Returns:
+            list: Path as list of (x, y) tuples, or None if unreachable
+        """
+        # Create a wrapper OGM that checks both global OGM and local mapper
+        class IntegratedOGM:
+            def __init__(self, global_ogm, local_mapper):
+                self.global_ogm = global_ogm
+                self.local_mapper = local_mapper
+                # Forward width and height from global OGM
+                self.width = global_ogm.width
+                self.height = global_ogm.height
+                # Import OGM constants for state checking
+                from ogm import OCCUPIED, FREE, GOAL, UNKNOWN
+                self.OCCUPIED = OCCUPIED
+                self.FREE = FREE
+                self.GOAL = GOAL
+                self.UNKNOWN = UNKNOWN
+            
+            def get_cell_state(self, x, y):
+                """Get cell state, treating dynamic obstacles as OCCUPIED."""
+                # Get state from global OGM
+                global_state = self.global_ogm.get_cell_state(x, y)
+                
+                # If already occupied in global map, return that
+                if global_state == self.OCCUPIED:
+                    return self.OCCUPIED
+                
+                # Check local mapper for dynamic obstacles
+                if self.local_mapper:
+                    if not self.local_mapper.is_traversable(x, y, allow_goals=True):
+                        # Cell is blocked by dynamic obstacle, treat as occupied
+                        return self.OCCUPIED
+                
+                # Return global state (FREE, GOAL, or UNKNOWN)
+                return global_state
+            
+            def is_obstacle(self, x, y):
+                """Check if cell is an obstacle (static or dynamic)."""
+                # Check global OGM first
+                if self.global_ogm.is_obstacle(x, y):
+                    return True
+                # Check local mapper for dynamic obstacles
+                if self.local_mapper and not self.local_mapper.is_traversable(x, y, allow_goals=True):
+                    return True
+                return False
+        
+        # Create integrated OGM wrapper
+        integrated_ogm = IntegratedOGM(self.ogm, self.local_mapper)
+        
+        # Plan path using selected algorithm with integrated OGM
+        if self.pathfinding_algorithm == 'A*':
+            path = astar(start, target, integrated_ogm, allow_goals=allow_goals)
+        elif self.pathfinding_algorithm == 'DIJKSTRA':
+            path = dijkstra(start, target, integrated_ogm, allow_goals=allow_goals)
+        elif self.pathfinding_algorithm == 'RRT':
+            path = rrt(start, target, integrated_ogm, allow_goals=allow_goals)
+        elif self.pathfinding_algorithm == 'PRM':
+            path = prm(start, target, integrated_ogm, allow_goals=allow_goals)
+        else:
+            # Fallback to A*
+            path = astar(start, target, integrated_ogm, allow_goals=allow_goals)
+        
+        return path
+    
     def pathfind_cached(self, start, target, allow_goals=True):
         """
         Pathfinding with caching to avoid redundant calculations.
         Uses the selected pathfinding algorithm (A*, Dijkstra, RRT, or PRM).
+        Validates cached paths against local map for dynamic obstacles.
         
         Args:
             start: (x, y) starting position
@@ -349,21 +575,25 @@ class Robot:
         cache_key = (start, target, allow_goals, self.pathfinding_algorithm)
         if cache_key in self.path_cache:
             path = self.path_cache[cache_key]
-            self.current_path = path if path else []
-            return path
+            # Validate path against local map (check for dynamic obstacles)
+            if path and self.local_mapper:
+                is_valid, blocking_cells = self.check_path_validity(path)
+                if not is_valid:
+                    # Path blocked by dynamic obstacle, invalidate cache and replan
+                    debug_log(f"Cached path blocked by dynamic obstacles at {blocking_cells}, replanning...")
+                    del self.path_cache[cache_key]
+                    # Continue to pathfinding below
+                else:
+                    # Path is valid, return cached path
+                    self.current_path = path if path else []
+                    return path
+            else:
+                # No local mapper or no path, return cached result
+                self.current_path = path if path else []
+                return path
         
-        # Plan path using selected algorithm
-        if self.pathfinding_algorithm == 'A*':
-            path = astar(start, target, self.ogm, allow_goals=allow_goals)
-        elif self.pathfinding_algorithm == 'DIJKSTRA':
-            path = dijkstra(start, target, self.ogm, allow_goals=allow_goals)
-        elif self.pathfinding_algorithm == 'RRT':
-            path = rrt(start, target, self.ogm, allow_goals=allow_goals)
-        elif self.pathfinding_algorithm == 'PRM':
-            path = prm(start, target, self.ogm, allow_goals=allow_goals)
-        else:
-            # Fallback to A*
-            path = astar(start, target, self.ogm, allow_goals=allow_goals)
+        # Plan path using selected algorithm with integrated local map checking
+        path = self._integrated_pathfind(start, target, allow_goals)
         
         # Store path for visualization
         self.current_path = path if path else []
@@ -572,6 +802,17 @@ class Robot:
                 # Switch to goal delivery mode
                 self.exploration_mode = "DELIVER_GOALS"
                 self.delivery_mode = "PICKUP"
+                # Clear local mapper dynamic obstacles (they'll be re-added when spawned)
+                if self.local_mapper:
+                    # Clear only dynamic obstacle data, keep static map
+                    cells_to_remove = []
+                    for (x, y), cell_data in self.local_mapper.local_map.items():
+                        if cell_data.get('state') == LOCAL_DYNAMIC_OCCUPIED:
+                            cells_to_remove.append((x, y))
+                    for cell in cells_to_remove:
+                        del self.local_mapper.local_map[cell]
+                    self.local_mapper.obstacle_tracker = DynamicObstacleTracker(max_history=10)
+                    debug_log("Cleared local mapper dynamic obstacle data for delivery phase")
                 # Plan goal delivery paths
                 self.plan_goal_delivery()
                 return True
@@ -614,6 +855,17 @@ class Robot:
                         # Switch to goal delivery mode
                         self.exploration_mode = "DELIVER_GOALS"
                         self.delivery_mode = "PICKUP"
+                        # Clear local mapper dynamic obstacles (they'll be re-added when spawned)
+                        if self.local_mapper:
+                            # Clear only dynamic obstacle data, keep static map
+                            cells_to_remove = []
+                            for (x, y), cell_data in self.local_mapper.local_map.items():
+                                if cell_data.get('state') == LOCAL_DYNAMIC_OCCUPIED:
+                                    cells_to_remove.append((x, y))
+                            for cell in cells_to_remove:
+                                del self.local_mapper.local_map[cell]
+                            self.local_mapper.obstacle_tracker = DynamicObstacleTracker(max_history=10)
+                            debug_log("Cleared local mapper dynamic obstacle data for delivery phase")
                         # Initialize statistics tracking
                         self.statistics['start_time'] = time.time()
                         # Plan goal delivery paths
@@ -896,6 +1148,10 @@ class Robot:
         self.path_cache = {}
         self.path_cache_max_size = 100
         
+        # Reset local mapper
+        if self.local_mapper:
+            self.local_mapper.clear()
+        
         # Mark starting position as explored
         self.update_with_sensor()
         start_pos = (int(self.x), int(self.y))
@@ -978,8 +1234,42 @@ class Robot:
         
         return False
     
+    def _draw_local_map(self, surface):
+        """Draw local map window around robot with cell states and confidence levels."""
+        from local_mapper import LOCAL_FREE, LOCAL_OCCUPIED, LOCAL_DYNAMIC_OCCUPIED
+        
+        robot_pos = (self.x, self.y)
+        local_window = self.local_mapper.get_local_map_window(robot_pos)
+        
+        # Draw local map cells with semi-transparent overlay
+        for (x, y), cell_data in local_window.items():
+            cell_x = x * GRID_SIZE
+            cell_y = y * GRID_SIZE
+            state = cell_data['state']
+            confidence = cell_data.get('confidence', 1.0)
+            
+            # Create semi-transparent surface for overlay
+            overlay = pygame.Surface((GRID_SIZE, GRID_SIZE), pygame.SRCALPHA)
+            
+            # Color code by state
+            if state == LOCAL_FREE:
+                color = (0, 255, 0, int(50 * confidence))  # Green, semi-transparent
+            elif state == LOCAL_OCCUPIED:
+                color = (255, 0, 0, int(100 * confidence))  # Red
+            elif state == LOCAL_DYNAMIC_OCCUPIED:
+                color = (255, 165, 0, int(150 * confidence))  # Orange for dynamic obstacles
+            else:
+                continue
+            
+            overlay.fill(color)
+            surface.blit(overlay, (cell_x, cell_y))
+    
     def draw(self, surface):
         """Draw the robot with rotation, estimated pose, trajectory, and planned path."""
+        # Draw local map window around robot
+        if self.local_mapper:
+            self._draw_local_map(surface)
+        
         # Draw planned path (if any) with improved visualization
         if hasattr(self, 'current_path') and self.current_path and len(self.current_path) > 1:
             # Color code by algorithm with transparency effect
@@ -995,8 +1285,37 @@ class Robot:
                            int(y * GRID_SIZE + GRID_SIZE // 2)) 
                           for x, y in self.current_path]
             if len(path_points) > 1:
-                # Draw path with gradient effect (thicker line)
-                pygame.draw.lines(surface, path_color, False, path_points, 4)
+                # Check path validity and highlight blocked segments
+                is_valid, blocking_cells = self.check_path_validity(self.current_path) if self.local_mapper else (True, [])
+                blocking_set = set(blocking_cells)
+                
+                # Draw path segments, highlighting blocked ones
+                for i in range(len(path_points) - 1):
+                    x1, y1 = path_points[i]
+                    x2, y2 = path_points[i + 1]
+                    
+                    # Check if this segment is blocked
+                    segment_blocked = False
+                    if i < len(self.current_path):
+                        cell = self.current_path[i]
+                        if cell in blocking_set:
+                            segment_blocked = True
+                    
+                    # Draw segment with different color if blocked
+                    if segment_blocked:
+                        pygame.draw.line(surface, (255, 0, 255), (x1, y1), (x2, y2), 6)  # Magenta for blocked
+                    else:
+                        pygame.draw.line(surface, path_color, (x1, y1), (x2, y2), 4)
+                
+                # Draw blocked cells with X marks
+                for x, y in blocking_cells:
+                    cell_x = int(x * GRID_SIZE + GRID_SIZE // 2)
+                    cell_y = int(y * GRID_SIZE + GRID_SIZE // 2)
+                    # Draw X mark
+                    pygame.draw.line(surface, (255, 0, 255), 
+                                   (cell_x - 8, cell_y - 8), (cell_x + 8, cell_y + 8), 3)
+                    pygame.draw.line(surface, (255, 0, 255), 
+                                   (cell_x + 8, cell_y - 8), (cell_x - 8, cell_y + 8), 3)
                 
                 # Draw path nodes with different sizes
                 for i, (px, py) in enumerate(path_points):
