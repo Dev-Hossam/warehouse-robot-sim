@@ -21,7 +21,7 @@ parser.add_argument('--algo', type=str, default='A*',
                     choices=['A*', 'astar', 'A-star', 'A_star', 'dijkstra', 'Dijkstra'],
                     help='Pathfinding algorithm to use (default: A*)')
 parser.add_argument('--map', type=str, default='map1',
-                    choices=['map1', 'map2', 'map3', 'map4'],
+                    choices=['map1', 'map2', 'map3', 'map4', 'map5', 'map6', 'map7'],
                     help='Map configuration to use (default: map1)')
 parser.add_argument('--obj', type=int, default=0,
                     help='Number of dynamic obstacles to spawn (default: 0, only spawns for map4 if not specified)')
@@ -55,9 +55,23 @@ if args.obj > 0:
     debug_log(f"Dynamic Obstacles: {args.obj}")
 debug_log(f"Robot Speed: {args.robot_speed}ms cooldown")
 debug_log(f"Obstacle Speed: {args.obstacle_speed}ms cooldown")
+if args.map in ['map5', 'map7']:
+    if args.map == 'map5':
+        debug_log("RED BOX FEATURE ACTIVE (Map5 - Random red boxes)")
+    elif args.map == 'map7':
+        debug_log("RED BOX FEATURE ACTIVE (Map7 - Static red boxes, 10 locations)")
 debug_log("=" * 50)
 warehouse = Warehouse(map_name=args.map, num_dynamic_obstacles=args.obj, obstacle_speed=args.obstacle_speed)
 robot = Robot(1, 1, warehouse=warehouse, pathfinding_algorithm=algorithm, move_cooldown=args.robot_speed)
+
+# Red box spawn timer (for map5 and map7)
+red_box_spawn_timer = 0
+red_box_spawn_interval_min = 10000  # 10 seconds
+red_box_spawn_interval_max = 15000  # 15 seconds
+next_red_box_spawn_time = 0
+if args.map in ['map5', 'map7']:
+    import random
+    next_red_box_spawn_time = pygame.time.get_ticks() + random.randint(red_box_spawn_interval_min, red_box_spawn_interval_max)
 
 # Start autonomous mapping phase
 debug_log("")
@@ -93,6 +107,24 @@ while running:
     # Update dynamic obstacles (only if spawned and mission not complete)
     if warehouse.dynamic_obstacles_spawned and not mission_complete:
         warehouse.update_dynamic_obstacles(current_time)
+    
+    # Red box management (for map5 and map7, after mission starts)
+    if args.map in ['map5', 'map7'] and robot.exploration_mode == "DELIVER_GOALS" and not mission_complete:
+        # Check red box expiration
+        warehouse.check_red_box_expiration(current_time)
+        
+        # Check if it's time to spawn a new red box
+        if warehouse.red_box is None and current_time >= next_red_box_spawn_time:
+            warehouse.spawn_red_box()
+            # Schedule next spawn (10-15 seconds from now) - only for map5 (map7 uses static sequence)
+            if args.map == 'map5':
+                import random
+                next_red_box_spawn_time = current_time + random.randint(red_box_spawn_interval_min, red_box_spawn_interval_max)
+            elif args.map == 'map7':
+                # For map7, schedule next spawn if we haven't reached the limit
+                if warehouse.total_red_boxes_spawned < 10 and warehouse.red_box_spawn_index < len(warehouse.static_red_box_locations):
+                    import random
+                    next_red_box_spawn_time = current_time + random.randint(red_box_spawn_interval_min, red_box_spawn_interval_max)
     
     # Update local map with dynamic obstacles and apply temporal decay (only if mission not complete)
     if not mission_complete:

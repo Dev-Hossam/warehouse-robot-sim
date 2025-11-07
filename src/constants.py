@@ -24,6 +24,10 @@ YELLOW = (255, 255, 0)
 LOADING_DOCK = (255, 165, 0)  # Orange
 DISCHARGE_DOCK = (200, 0, 200)  # Purple
 GOAL_COLOR = (0, 255, 0)  # Bright green
+RED_BOX_COLOR = (255, 0, 0)  # Bright red for high-priority cargo
+
+# Red box settings
+RED_BOX_EXPIRATION_TIME = 7000  # 7 seconds in milliseconds
 
 # Debugging flag
 DEBUG = True

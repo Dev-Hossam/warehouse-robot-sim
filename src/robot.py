@@ -133,6 +133,10 @@ class Robot:
         self.goal_retry_attempts = {}  # Track retry attempts per goal: {goal: attempt_count}
         self.max_goal_retry_attempts = 20  # Maximum retry attempts before giving up on a goal
         
+        # Red box (high-priority cargo) state
+        self.current_red_box = None  # (x, y) position or None
+        self.dropped_goals = []  # List of (goal_pos, drop_location) tuples for interrupted goals
+        
         # Path caching to avoid redundant pathfinding calculations
         self.path_cache = {}  # Cache: {(start, target, allow_goals, algorithm): path}
         self.path_cache_max_size = 100  # Maximum number of cached paths
@@ -159,7 +163,9 @@ class Robot:
             'actual_cells_to_current_goal': 0,  # Track actual cells traversed
             'actual_cells_to_current_dock': 0,  # Track actual cells traversed
             'total_replans': 0,  # Total number of replans during mission
-            'total_pathfinding_cells': 0  # Total cells in ALL paths computed (includes initial paths + all replan paths)
+            'total_pathfinding_cells': 0,  # Total cells in ALL paths computed (includes initial paths + all replan paths)
+            'red_box_deliveries': [],  # List of red box delivery statistics
+            'total_red_box_deliveries': 0  # Total red box deliveries
         }
         
         debug_log(f"Robot initialized at ({x}, {y}) with DFS coverage exploration")
@@ -460,7 +466,18 @@ class Robot:
                 current_pos = (int(self.x), int(self.y))
                 
                 # Determine target based on delivery mode
-                if self.delivery_mode == "PICKUP" and self.goals_to_deliver:
+                # PRIORITY: Red box takes precedence over regular goals
+                if self.current_red_box is not None:
+                    # Replanning for red box
+                    if self.delivery_mode == "PICKUP":
+                        target = self.current_red_box
+                        allow_unknown = False  # Red box location is known
+                    elif self.delivery_mode == "DROPOFF" and self.warehouse and self.warehouse.discharge_dock:
+                        target = self.warehouse.discharge_dock
+                        allow_unknown = True
+                    else:
+                        return False
+                elif self.delivery_mode == "PICKUP" and self.goals_to_deliver:
                     target = self.goals_to_deliver[0]
                     # Check if goal is discovered
                     goal_discovered = target in self.ogm.goals if self.ogm else False
@@ -760,6 +777,48 @@ class Robot:
         self.delivery_path = []
         self.delivery_path_index = 0
         debug_log(f"Initialized goal delivery: {len(self.goals_to_deliver)} goals to deliver")
+    
+    def drop_current_goal_at_location(self):
+        """
+        Drop current cargo at current location to prioritize red box.
+        Saves the goal and drop location for later resumption.
+        """
+        if not self.has_cargo or not self.current_goal:
+            return
+        
+        current_pos = (int(self.x), int(self.y))
+        drop_info = (self.current_goal, current_pos)
+        self.dropped_goals.append(drop_info)
+        
+        debug_log(f"DROPPING CARGO: Goal {self.current_goal} dropped at {current_pos} for red box priority")
+        
+        # Clear cargo and delivery state
+        self.has_cargo = False
+        self.current_goal = None
+        self.delivery_path = []
+        self.delivery_path_index = 0
+        self.current_path = []
+    
+    def resume_dropped_goals(self):
+        """
+        Resume delivery of dropped goals after red box is delivered.
+        Inserts dropped goals back at the front of goals_to_deliver.
+        """
+        if not self.dropped_goals:
+            return
+        
+        # Resume most recently dropped goal first (LIFO)
+        while self.dropped_goals:
+            goal_pos, drop_location = self.dropped_goals.pop()
+            
+            # Check if goal is still in warehouse goals (hasn't been collected by other means)
+            if goal_pos in self.warehouse.goals:
+                # Insert at front of goals_to_deliver to resume with highest priority
+                if goal_pos not in self.goals_to_deliver:
+                    self.goals_to_deliver.insert(0, goal_pos)
+                    debug_log(f"RESUMING DROPPED GOAL: {goal_pos} (was dropped at {drop_location})")
+            else:
+                debug_log(f"Dropped goal {goal_pos} no longer exists, skipping")
 
     def explore_next(self, current_time):
         """Execute one step of DFS coverage exploration."""
@@ -947,7 +1006,214 @@ class Robot:
         
         elif self.exploration_mode == "DELIVER_GOALS":
             # Goal delivery phase: pick up goals and deliver to discharge dock
-            if not self.delivery_path or self.delivery_path_index >= len(self.delivery_path):
+            
+            # RED BOX PRIORITY CHECK - Handle high-priority red box before regular goals (on map5 and map7)
+            # This check must happen FIRST, even if robot is executing a path, to allow interruption
+            # Enter block if: new red box exists OR robot is currently pursuing/delivering a red box
+            if self.warehouse and self.warehouse.map_name in ['map5', 'map7'] and (self.warehouse.red_box is not None or self.current_red_box is not None):
+                # Use warehouse red box if available, otherwise use tracked red box position
+                red_box_pos = self.warehouse.red_box if self.warehouse.red_box is not None else self.current_red_box
+                current_pos = (int(self.x), int(self.y))
+                
+                # Check if robot is currently pursuing red box
+                if self.current_red_box is not None:
+                    # Robot is actively pursuing red box - allow pickup/delivery checks
+                    # Robot is already pursuing red box
+                    
+                    # Check if red box expired (not if picked up - robot will have cargo if picked up)
+                    if self.warehouse.red_box is None and not self.has_cargo:
+                        # Red box expired while pursuing (not picked up), clear tracking
+                        debug_log(f"Red box expired while pursuing, resuming normal operations")
+                        self.current_red_box = None
+                        # Clear delivery path so normal goal logic can take over
+                        self.delivery_path = []
+                        self.delivery_path_index = 0
+                        self.current_path = []
+                        # Don't resume dropped goals here - they were never dropped if we were just going to red box
+                        # Continue to normal goal logic below
+                    
+                    # Check if we're at red box location (pickup)
+                    # Only pick up if robot is actively pursuing this red box (current_red_box matches)
+                    elif not self.has_cargo and abs(self.x - red_box_pos[0]) < 0.5 and abs(self.y - red_box_pos[1]) < 0.5 and self.current_red_box == red_box_pos:
+                        # Pick up red box (only if actively pursuing it)
+                        self.has_cargo = True
+                        self.current_goal = red_box_pos
+                        self.warehouse.clear_red_box()
+                        debug_log(f"RED BOX PICKED UP at {red_box_pos}")
+                        
+                        # Track red box pickup time
+                        red_box_pickup_time = time.time()
+                        self.statistics['current_red_box_pickup_time'] = red_box_pickup_time
+                        
+                        # Clear delivery path and plan path to discharge dock
+                        self.delivery_path = []
+                        self.delivery_path_index = 0
+                        self.current_path = []
+                        self.delivery_mode = "DROPOFF"
+                        
+                        # Plan path to discharge dock
+                        discharge_dock = self.warehouse.discharge_dock
+                        if discharge_dock:
+                            path = self.astar_cached(current_pos, discharge_dock, allow_goals=True, allow_unknown=True)
+                            if path and len(path) > 1:
+                                self.delivery_path = path[1:]
+                                self.delivery_path_index = 0
+                                self.current_path = [current_pos] + self.delivery_path if self.delivery_path else []
+                                debug_log(f"RED BOX: Planned path to discharge dock: {len(self.delivery_path)} steps")
+                        return False
+                    
+                    # Check if we're at discharge dock (delivery)
+                    elif self.has_cargo and self.warehouse.discharge_dock:
+                        dock_x, dock_y = self.warehouse.discharge_dock[0], self.warehouse.discharge_dock[1]
+                        if abs(self.x - dock_x) < 0.5 and abs(self.y - dock_y) < 0.5:
+                            # Deliver red box
+                            self.has_cargo = False
+                            
+                            # Track red box delivery
+                            red_box_delivery_time = time.time()
+                            pickup_time = self.statistics.get('current_red_box_pickup_time', red_box_delivery_time)
+                            delivery_duration = red_box_delivery_time - pickup_time
+                            
+                            red_box_stat = {
+                                'red_box_location': red_box_pos,
+                                'pickup_timestamp': pickup_time,
+                                'delivery_timestamp': red_box_delivery_time,
+                                'delivery_duration': delivery_duration
+                            }
+                            self.statistics['red_box_deliveries'].append(red_box_stat)
+                            self.statistics['total_red_box_deliveries'] += 1
+                            self.score += 1
+                            
+                            debug_log(f"RED BOX DELIVERED! Total red boxes: {self.statistics['total_red_box_deliveries']}, Time: {delivery_duration:.2f}s")
+                            
+                            # Clear red box tracking
+                            self.current_red_box = None
+                            self.current_goal = None
+                            self.delivery_path = []
+                            self.delivery_path_index = 0
+                            self.current_path = []
+                            
+                            # Resume dropped goals
+                            self.resume_dropped_goals()
+                            
+                            # Reset to pickup mode for next goal
+                            self.delivery_mode = "PICKUP"
+                            
+                            # Check if another red box is available (prioritize red box over regular goals)
+                            if self.warehouse and self.warehouse.map_name in ['map5', 'map7'] and self.warehouse.red_box is not None:
+                                # Another red box is available - go get it immediately
+                                new_red_box_pos = self.warehouse.red_box
+                                debug_log(f"After red box delivery: Another red box available at {new_red_box_pos}, planning path to new red box")
+                                
+                                # Set new red box as priority target
+                                self.current_red_box = new_red_box_pos
+                                
+                                # Plan path to new red box
+                                path = self.astar_cached(current_pos, new_red_box_pos, allow_goals=True, allow_unknown=False)
+                                if path and len(path) > 1:
+                                    self.delivery_path = path[1:]
+                                    self.delivery_path_index = 0
+                                    self.current_path = [current_pos] + self.delivery_path if self.delivery_path else []
+                                    debug_log(f"After red box delivery: Planned path to new red box at {new_red_box_pos}: {len(self.delivery_path)} steps")
+                                    return False
+                                else:
+                                    debug_log(f"Warning: No path to new red box at {new_red_box_pos}")
+                                    self.current_red_box = None
+                                    # Fall through to regular goal logic if no path to red box
+                            
+                            # Plan path to next regular goal (if any and no red box)
+                            if self.goals_to_deliver and self.current_red_box is None:
+                                next_goal = self.goals_to_deliver[0]
+                                self.current_goal = next_goal  # Set current goal for tracking
+                                self.statistics['current_goal_start_time'] = time.time()
+                                self.statistics['current_goal_start_pos'] = current_pos
+                                self.statistics['actual_cells_to_current_goal'] = 0
+                                self.statistics['actual_cells_to_current_dock'] = 0
+                                
+                                goal_discovered = next_goal in self.ogm.goals if self.ogm else False
+                                path = self.astar_cached(current_pos, next_goal, allow_goals=True, allow_unknown=goal_discovered)
+                                if path and len(path) > 1:
+                                    self.delivery_path = path[1:]
+                                    self.delivery_path_index = 0
+                                    self.current_path = [current_pos] + self.delivery_path if self.delivery_path else []
+                                    self.statistics['cells_to_current_goal'] = len(path) - 1
+                                    debug_log(f"After red box delivery: Planned path to next goal {next_goal}: {len(self.delivery_path)} steps")
+                                    # Continue to path execution below - don't return False
+                                else:
+                                    debug_log(f"After red box delivery: No path to next goal {next_goal}, will retry")
+                                    return False
+                            else:
+                                debug_log("After red box delivery: No more goals to deliver")
+                                return False
+                            
+                            # Continue to path execution below (path was planned successfully)
+                    
+                    # Robot is still pursuing red box (not at pickup or delivery location yet)
+                    # Use same logic as green boxes - let replan_if_needed() handle dynamic obstacles
+                    # Just continue with path execution, replanning is handled automatically
+                    debug_log(f"RED BOX: Pursuing red box, continuing to path execution. Path length: {len(self.delivery_path)}, index: {self.delivery_path_index}, has_cargo: {self.has_cargo}")
+                
+                # Check if new red box appeared and robot should interrupt current task
+                elif self.current_red_box is None:
+                    # New red box detected, but robot is NOT actively pursuing it
+                    # IMPORTANT: Do NOT pick up red box just because robot happens to be at that location
+                    # Only interrupt if robot is not at a goal location (to avoid accidental pickup)
+                    
+                    # Check if robot is currently at a goal location (might be picking up green box)
+                    at_goal_location = False
+                    if self.goals_to_deliver:
+                        for goal in self.goals_to_deliver:
+                            if abs(self.x - goal[0]) < 0.5 and abs(self.y - goal[1]) < 0.5:
+                                at_goal_location = True
+                                break
+                    
+                    # If robot is at a goal location, don't interrupt - let normal goal logic handle it first
+                    if at_goal_location:
+                        debug_log(f"RED BOX: New red box at {red_box_pos}, but robot is at goal location. Will check after goal pickup.")
+                        # Don't set current_red_box yet - let normal goal logic run first
+                        # The red box will be handled on the next call if still available
+                        # Don't return - fall through to normal goal logic
+                    # NEW BEHAVIOR: If robot is carrying cargo, finish delivery first, then get red box
+                    # If robot is moving towards a goal (not carrying), interrupt and go to red box
+                    elif self.has_cargo:
+                        # Robot is carrying cargo - don't interrupt, don't set current_red_box yet
+                        # Let normal delivery logic handle the cargo first
+                        # After delivery (line 1429), red box will be checked and picked up
+                        debug_log(f"RED BOX PRIORITY: New red box detected at {red_box_pos}, but robot is carrying cargo. Will get red box after delivery.")
+                        # DON'T set current_red_box here - it blocks normal delivery logic!
+                        # The red box will be handled after delivery completes
+                        # Don't return - fall through to normal goal delivery logic to complete current delivery
+                    else:
+                        # Robot is not carrying cargo - interrupt current task and go to red box
+                        debug_log(f"RED BOX PRIORITY: New red box detected at {red_box_pos}, interrupting current task to prioritize red box")
+                        
+                        # Clear any existing delivery path to interrupt current task
+                        self.delivery_path = []
+                        self.delivery_path_index = 0
+                        self.current_path = []
+                        
+                        # Set red box as priority target
+                        self.current_red_box = red_box_pos
+                        self.delivery_mode = "PICKUP"
+                        
+                        # Plan path to red box (same as green box logic)
+                        path = self.astar_cached(current_pos, red_box_pos, allow_goals=True, allow_unknown=False)
+                        if path and len(path) > 1:
+                            self.delivery_path = path[1:]
+                            self.delivery_path_index = 0
+                            self.current_path = [current_pos] + self.delivery_path if self.delivery_path else []
+                            debug_log(f"RED BOX PRIORITY: Interrupted current task, planned path to red box at {red_box_pos}: {len(self.delivery_path)} steps")
+                            return False  # Return here since we're handling red box
+                        else:
+                            debug_log(f"RED BOX PRIORITY: No path to red box at {red_box_pos} yet, will retry")
+                            # Can't reach red box right now - continue trying like we do for green boxes
+                            # Don't clear current_red_box - keep trying just like green boxes
+                            # Fall through to path execution which will trigger replanning
+                            return False
+            
+            # Normal goal delivery (no red box or red box already being handled)
+            # Skip this section if currently pursuing a red box
+            if self.current_red_box is None and (not self.delivery_path or self.delivery_path_index >= len(self.delivery_path)):
                 # Path complete or no path - check if we're at a goal or dock
                 current_pos = (int(self.x), int(self.y))
                 
@@ -983,6 +1249,12 @@ class Robot:
                         else:
                             self.statistics['time_to_goal'] = 0.0
                             self.statistics['cells_to_current_goal'] = 0
+                        
+                        # Track goal pickup timestamp and location
+                        pickup_timestamp = time.time()
+                        goal_location = (goal_x, goal_y)
+                        self.statistics['current_goal_pickup_time'] = pickup_timestamp
+                        self.statistics['current_goal_location'] = goal_location
                         
                         debug_log(f"Picked up cargo at goal ({goal_x}, {goal_y}) - priority goal")
                         debug_log(f"  Cells to goal: {self.statistics['cells_to_current_goal']}, Time: {self.statistics['time_to_goal']:.2f}s")
@@ -1119,9 +1391,19 @@ class Robot:
                                 self.statistics['time_to_dock'] = 0.0
                                 self.statistics['cells_to_current_dock'] = 0
                             
+                            # Track discharge timestamp and location
+                            discharge_timestamp = time.time()
+                            discharge_location = (dock_x, dock_y)
+                            pickup_timestamp = self.statistics.get('current_goal_pickup_time', discharge_timestamp)
+                            goal_location = self.statistics.get('current_goal_location', self.current_goal)
+                            
                             # Store goal statistics
                             goal_stat = {
                                 'goal': self.current_goal,
+                                'goal_location': goal_location,
+                                'pickup_timestamp': pickup_timestamp,
+                                'discharge_location': discharge_location,
+                                'discharge_timestamp': discharge_timestamp,
                                 'cells_to_goal': self.statistics['cells_to_current_goal'],
                                 'cells_to_dock': self.statistics['cells_to_current_dock'],
                                 'actual_cells_to_goal': self.statistics['actual_cells_to_current_goal'],
@@ -1151,10 +1433,40 @@ class Robot:
                             self.delivery_mode = "PICKUP"
                             self.statistics['current_goal_start_time'] = None
                             self.statistics['current_goal_start_pos'] = None
+                            self.statistics['current_goal_pickup_time'] = None
+                            self.statistics['current_goal_location'] = None
                             self.statistics['cells_to_current_goal'] = 0
                             self.statistics['cells_to_current_dock'] = 0
                             self.statistics['actual_cells_to_current_goal'] = 0
                             self.statistics['actual_cells_to_current_dock'] = 0
+                            
+                            # Check if red box is available (prioritize red box after delivery)
+                            current_pos = (int(self.x), int(self.y))
+                            if self.warehouse and self.warehouse.map_name in ['map5', 'map7'] and self.warehouse.red_box is not None:
+                                # Red box is available - go get it now (prioritize over regular goals)
+                                red_box_pos = self.warehouse.red_box
+                                debug_log(f"After cargo delivery: Red box available at {red_box_pos}, planning path to red box")
+                                
+                                # Clear old path
+                                self.delivery_path = []
+                                self.delivery_path_index = 0
+                                self.current_path = []
+                                
+                                # Set red box as priority target
+                                self.current_red_box = red_box_pos
+                                self.delivery_mode = "PICKUP"
+                                
+                                # Plan path to red box
+                                path = self.astar_cached(current_pos, red_box_pos, allow_goals=True, allow_unknown=False)
+                                if path and len(path) > 1:
+                                    self.delivery_path = path[1:]
+                                    self.delivery_path_index = 0
+                                    self.current_path = [current_pos] + self.delivery_path if self.delivery_path else []
+                                    debug_log(f"After cargo delivery: Planned path to red box at {red_box_pos}: {len(self.delivery_path)} steps")
+                                    return False  # Continue to path execution
+                                else:
+                                    debug_log(f"Warning: No path to red box at {red_box_pos} after cargo delivery")
+                                    self.current_red_box = None  # Clear tracking if no path
                             
                             # Check if more goals to deliver
                             if self.goals_to_deliver:
@@ -1276,7 +1588,11 @@ class Robot:
                 nx, ny = next_cell
                 
                 if current_time - self.last_move_time >= self.move_cooldown:
-                    if self.move_to(nx, ny, current_time):
+                    # Debug: Check if move is successful
+                    move_result = self.move_to(nx, ny, current_time)
+                    if not move_result:
+                        debug_log(f"Path execution FAILED: Move to ({nx}, {ny}) failed from ({int(self.x)}, {int(self.y)}), red_box tracking: {self.current_red_box is not None}")
+                    if move_result:
                         self.delivery_path_index += 1
                         # Rotate towards direction
                         if self.delivery_path_index < len(self.delivery_path):
@@ -1354,8 +1670,14 @@ class Robot:
             'actual_cells_to_current_goal': 0,
             'actual_cells_to_current_dock': 0,
             'total_replans': 0,
-            'total_pathfinding_cells': 0
+            'total_pathfinding_cells': 0,
+            'red_box_deliveries': [],
+            'total_red_box_deliveries': 0
         }
+        
+        # Reset red box state
+        self.current_red_box = None
+        self.dropped_goals = []
         
         # Reset metrics saved flag
         if hasattr(self, 'metrics_saved'):
@@ -1420,6 +1742,13 @@ class Robot:
             self.has_cargo = True
             warehouse.goals.remove(self.current_goal)
             self.last_action_time = current_time
+            
+            # Track goal pickup timestamp and location
+            pickup_timestamp = time.time()
+            goal_location = (goal_x, goal_y)
+            self.statistics['current_goal_pickup_time'] = pickup_timestamp
+            self.statistics['current_goal_location'] = goal_location
+            
             debug_log(f"Picked up cargo at goal ({goal_x}, {goal_y})")
             return True
         
@@ -1438,6 +1767,33 @@ class Robot:
             self.has_cargo = False
             self.score += 1
             self.last_action_time = current_time
+            
+            # Track discharge timestamp and location
+            discharge_timestamp = time.time()
+            discharge_location = (dock_x, dock_y)
+            pickup_timestamp = self.statistics.get('current_goal_pickup_time', discharge_timestamp)
+            goal_location = self.statistics.get('current_goal_location', self.current_goal if self.current_goal else (0, 0))
+            
+            # Store goal statistics for manual drop
+            goal_stat = {
+                'goal': self.current_goal if self.current_goal else goal_location,
+                'goal_location': goal_location,
+                'pickup_timestamp': pickup_timestamp,
+                'discharge_location': discharge_location,
+                'discharge_timestamp': discharge_timestamp,
+                'cells_to_goal': 0,
+                'cells_to_dock': 0,
+                'actual_cells_to_goal': 0,
+                'actual_cells_to_dock': 0,
+                'time_to_goal': 0.0,
+                'time_to_dock': 0.0,
+                'total_cells': 0,
+                'actual_total_cells': 0,
+                'total_time': 0.0
+            }
+            self.statistics['goals'].append(goal_stat)
+            self.statistics['total_goals_delivered'] += 1
+            
             debug_log(f"Dropped cargo at discharge dock ({dock_x}, {dock_y}). Score: {self.score}")
             if warehouse.goals:
                 self.current_goal = warehouse.goals[0]
@@ -1719,5 +2075,13 @@ class Robot:
             
             # Replanning metrics
             'total_replans': self.statistics['total_replans'],
-            'avg_replans_per_goal': avg_replans_per_goal
+            'avg_replans_per_goal': avg_replans_per_goal,
+            
+            # Red box (high-priority cargo) metrics
+            'total_red_box_deliveries': self.statistics['total_red_box_deliveries'],
+            'red_box_deliveries': self.statistics['red_box_deliveries'],
+            
+            # Goal tracking data
+            'goals_data': self.statistics['goals'],
+            'start_time': self.statistics['start_time']
         }
