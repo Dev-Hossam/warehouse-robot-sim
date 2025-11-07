@@ -1,0 +1,37 @@
+================================================================================
+METRICS REPORT - A* on MAP2 - Run #6
+================================================================================
+
+Metric                                                                      Value
+================================================================================
+
+MISSION SUMMARY
+--------------------------------------------------------------------------------
+Total Goals Delivered                                                           8
+Total Time Taken (seconds)                                                  65.01
+Total Static Obstacles                                                        158
+Total Dynamic Obstacles                                                         7
+
+SPEED SETTINGS
+--------------------------------------------------------------------------------
+Robot Speed (ms cooldown)                                                     150
+Obstacle Speed (ms cooldown)                                                  400
+
+ACTUAL TRAVERSAL (What Robot Actually Did)
+--------------------------------------------------------------------------------
+Total Cells Actually Traversed                                                340
+Average Path Length per Goal (actual)                                       43.25
+
+PLANNED vs ACTUAL COMPARISON
+--------------------------------------------------------------------------------
+Planned Avg Path Length per Goal                                            42.50
+Actual Avg Path Length per Goal                                             43.25
+Difference (actual - planned)                                                0.75
+
+REPLANNING METRICS
+--------------------------------------------------------------------------------
+Total Number of Replans                                                        41
+Average Replans per Goal                                                     5.12
+================================================================================
+
+Generated: 2025-11-07 17:01:53

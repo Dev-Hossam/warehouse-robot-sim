@@ -545,9 +545,10 @@ class Robot:
         """
         # Create a wrapper OGM that checks both global OGM and local mapper
         class IntegratedOGM:
-            def __init__(self, global_ogm, local_mapper):
+            def __init__(self, global_ogm, local_mapper, target_pos=None):
                 self.global_ogm = global_ogm
                 self.local_mapper = local_mapper
+                self.target_pos = target_pos  # Target position should never be marked as blocked
                 # Forward width and height from global OGM
                 self.width = global_ogm.width
                 self.height = global_ogm.height
@@ -567,6 +568,12 @@ class Robot:
                 if global_state == self.OCCUPIED:
                     return self.OCCUPIED
                 
+                # CRITICAL FIX: Don't check local mapper for target position
+                # This allows pathfinding to reach the target even if temporarily
+                # marked as occupied by dynamic obstacle predictions or stale observations
+                if self.target_pos and (x, y) == self.target_pos:
+                    return global_state
+                
                 # Check local mapper for dynamic obstacles
                 if self.local_mapper:
                     if not self.local_mapper.is_traversable(x, y, allow_goals=True):
@@ -578,6 +585,10 @@ class Robot:
             
             def is_obstacle(self, x, y):
                 """Check if cell is an obstacle (static or dynamic)."""
+                # CRITICAL FIX: Don't mark target position as obstacle
+                if self.target_pos and (x, y) == self.target_pos:
+                    return self.global_ogm.is_obstacle(x, y)
+                
                 # Check global OGM first
                 if self.global_ogm.is_obstacle(x, y):
                     return True
@@ -586,8 +597,8 @@ class Robot:
                     return True
                 return False
         
-        # Create integrated OGM wrapper
-        integrated_ogm = IntegratedOGM(self.ogm, self.local_mapper)
+        # Create integrated OGM wrapper with target position
+        integrated_ogm = IntegratedOGM(self.ogm, self.local_mapper, target_pos=target)
         
         # Plan path using selected algorithm with integrated OGM
         if self.pathfinding_algorithm == 'A*':
@@ -1473,7 +1484,7 @@ class Robot:
             surface.blit(overlay, (cell_x, cell_y))
     
     def draw(self, surface):
-        """Draw the robot with rotation, estimated pose, trajectory, and planned path."""
+        """Draw the robot with rotation, estimated pose, and planned path."""
         # Draw local map window around robot
         if self.local_mapper:
             self._draw_local_map(surface)
@@ -1598,14 +1609,6 @@ class Robot:
                             pygame.draw.polygon(surface, path_color, 
                                               [(x2, y2), (head_x1, head_y1), (head_x2, head_y2)])
         
-        # Draw trajectory
-        if len(self.pose_trajectory) > 1:
-            trajectory_points = [(int(x * GRID_SIZE + GRID_SIZE // 2), 
-                                 int(y * GRID_SIZE + GRID_SIZE // 2)) 
-                                for x, y in self.pose_trajectory[-100:]]
-            if len(trajectory_points) > 1:
-                pygame.draw.lines(surface, (200, 200, 200), False, trajectory_points, 2)
-        
         # Draw estimated pose from iSAM (green circle)
         estimated_pose = self.isam.get_estimated_pose()
         est_x_pixel = estimated_pose[0] * GRID_SIZE
@@ -1627,15 +1630,15 @@ class Robot:
         # Draw estimated pose (green circle)
         pygame.draw.circle(surface, (0, 255, 0), (est_center_x, est_center_y), GRID_SIZE // 4)
         
-        # Draw line from estimated to actual pose
+        # Draw line from estimated to actual pose (COMMENTED OUT - tail line removed)
         x_pixel = self.x * GRID_SIZE
         y_pixel = self.y * GRID_SIZE
         center_x = x_pixel + GRID_SIZE // 2
         center_y = y_pixel + GRID_SIZE // 2
         
-        pygame.draw.line(
-            surface, (255, 200, 0), (est_center_x, est_center_y), (center_x, center_y), 2
-        )
+        # pygame.draw.line(
+        #     surface, (255, 200, 0), (est_center_x, est_center_y), (center_x, center_y), 2
+        # )
         
         # Draw robot body (blue circle)
         pygame.draw.circle(surface, BLUE, (center_x, center_y), GRID_SIZE // 3)
