@@ -190,7 +190,7 @@ class LocalMapper:
         self.obstacle_tracker = DynamicObstacleTracker(max_history=10)
         
         # Configuration
-        self.prediction_horizon = 1  # Steps ahead to predict (reduced from 2 to be less aggressive)
+        self.prediction_horizon = 2  # Steps ahead to predict (increased from 1 to provide more warning time)
         self.min_confidence = 0.3  # Minimum confidence to consider observation valid
         
         debug_print(f"LocalMapper initialized with radius={radius}, decay_half_life={decay_half_life}")
@@ -264,6 +264,9 @@ class LocalMapper:
             dynamic_obstacles: List of DynamicObstacle objects
             current_time: Current timestamp in milliseconds
         """
+        # Track which cells are currently occupied by obstacles (actual positions and predictions)
+        current_obstacle_cells = set()
+        
         # Update obstacle tracker
         for i, obstacle in enumerate(dynamic_obstacles):
             obstacle_id = id(obstacle)  # Use object id as unique identifier
@@ -272,6 +275,7 @@ class LocalMapper:
             
             # Mark cell as dynamically occupied
             cell_x, cell_y = int(obstacle.x), int(obstacle.y)
+            current_obstacle_cells.add((cell_x, cell_y))
             self.local_map[(cell_x, cell_y)] = {
                 'state': LOCAL_DYNAMIC_OCCUPIED,
                 'timestamp': current_time,
@@ -282,12 +286,28 @@ class LocalMapper:
             # Also mark predicted positions (only if obstacle is moving)
             velocity = self.obstacle_tracker.obstacle_velocities.get(obstacle_id, (0, 0))
             speed = math.sqrt(velocity[0]**2 + velocity[1]**2)
-            # Only predict if obstacle is actually moving (speed > 0.1 cells/second)
+            
+            # If velocity is not yet available, use obstacle's current direction for immediate prediction
+            if speed < 0.1 and hasattr(obstacle, 'current_direction') and obstacle.current_direction:
+                # Estimate velocity from direction (obstacles move 1 cell per move_cooldown ms)
+                dx, dy = obstacle.current_direction
+                move_cooldown_sec = obstacle.move_cooldown / 1000.0  # Convert to seconds
+                if move_cooldown_sec > 0:
+                    estimated_vx = dx / move_cooldown_sec  # cells per second
+                    estimated_vy = dy / move_cooldown_sec
+                    velocity = (estimated_vx, estimated_vy)
+                    speed = math.sqrt(estimated_vx**2 + estimated_vy**2)
+                    # Store this estimate for immediate use
+                    self.obstacle_tracker.obstacle_velocities[obstacle_id] = velocity
+            
+            # Predict if obstacle is moving (using either calculated or estimated velocity)
             if speed > 0.1:
-                predicted_pos = self.obstacle_tracker.predict_position(obstacle_id, steps_ahead=self.prediction_horizon)
+                # Use actual obstacle move cooldown (0.25s) for accurate prediction timing
+                predicted_pos = self.obstacle_tracker.predict_position(obstacle_id, steps_ahead=self.prediction_horizon, time_per_step=0.25)
                 if predicted_pos:
                     pred_x, pred_y = int(predicted_pos[0]), int(predicted_pos[1])
                     if 0 <= pred_x < WAREHOUSE_WIDTH and 0 <= pred_y < WAREHOUSE_HEIGHT:
+                        current_obstacle_cells.add((pred_x, pred_y))
                         # Lower confidence for predictions - only mark if not already a static obstacle
                         if (pred_x, pred_y) not in self.local_map or \
                            self.local_map[(pred_x, pred_y)].get('state') != LOCAL_OCCUPIED:
@@ -298,6 +318,20 @@ class LocalMapper:
                                 'obstacle_id': obstacle_id,
                                 'predicted': True
                             }
+        
+        # Clear cells that were marked as dynamic obstacles but are no longer occupied
+        # This allows update_from_global_ogm to update them to FREE on the next cycle
+        cells_to_clear = []
+        for (x, y), cell_data in list(self.local_map.items()):
+            if cell_data.get('state') == LOCAL_DYNAMIC_OCCUPIED:
+                # Check if this cell is still occupied by a current obstacle
+                if (x, y) not in current_obstacle_cells:
+                    # Cell is no longer occupied, clear it so it can be updated to FREE
+                    cells_to_clear.append((x, y))
+        
+        # Clear the cells (they'll be updated to FREE by update_from_global_ogm on next update)
+        for cell in cells_to_clear:
+            del self.local_map[cell]
         
         # Clean up old obstacles
         self.obstacle_tracker.clear_old_obstacles(current_time, max_age=5.0)

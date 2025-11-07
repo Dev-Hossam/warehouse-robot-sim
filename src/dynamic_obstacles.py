@@ -29,7 +29,7 @@ class DynamicObstacle:
         # Movement properties
         self.movement_speed = 1  # Grid cells per move
         self.last_move_time = 0
-        self.move_cooldown = 100  # milliseconds between moves (slower than robot)
+        self.move_cooldown = 350  # milliseconds between moves (slower than robot)
         
         # Random movement state
         self.current_direction = None  # (dx, dy) tuple

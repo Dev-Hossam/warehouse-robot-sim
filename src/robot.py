@@ -97,7 +97,7 @@ class Robot:
         self.lidar = LidarSensor(max_range=8)
         
         # Initialize local mapper
-        self.local_mapper = LocalMapper(radius=12, decay_half_life=2.0)
+        self.local_mapper = LocalMapper(radius=12, decay_half_life=1.0)  # Reduced from 2.0 for faster response to obstacle movements
         
         # Initialize iSAM system
         self.isam = ISAM(initial_x=x, initial_y=y, initial_theta=0)
@@ -129,6 +129,10 @@ class Robot:
         self.delivery_path_index = 0
         self.delivery_mode = "PICKUP"  # PICKUP or DROPOFF
         self.goals_to_deliver = []  # Remaining goals to deliver (in priority order)
+        self.last_pathfind_retry_time = 0  # Time of last pathfinding retry attempt
+        self.pathfind_retry_cooldown = 500  # Milliseconds between pathfinding retries
+        self.goal_retry_attempts = {}  # Track retry attempts per goal: {goal: attempt_count}
+        self.max_goal_retry_attempts = 20  # Maximum retry attempts before giving up on a goal
         
         # Path caching to avoid redundant pathfinding calculations
         self.path_cache = {}  # Cache: {(start, target, allow_goals, algorithm): path}
@@ -140,7 +144,7 @@ class Robot:
         # Replanning protection
         self.replan_counter = 0  # Counter to prevent infinite replanning loops
         self.last_replan_time = 0  # Time of last replanning
-        self.max_replans_per_second = 5  # Maximum replans per second
+        self.max_replans_per_second = 10  # Maximum replans per second (increased from 5 for faster response)
         
         # Statistics tracking
         self.statistics = {
@@ -923,10 +927,12 @@ class Robot:
                                 self.delivery_path = path[1:]
                                 self.delivery_path_index = 0
                                 self.statistics['cells_to_current_dock'] = len(path) - 1  # Exclude start cell
+                                self.last_pathfind_retry_time = current_time  # Reset retry timer on success
                                 debug_log(f"Planned path to discharge dock: {len(self.delivery_path)} steps")
                                 return False
                             else:
-                                debug_log(f"Warning: No path from goal to discharge dock")
+                                debug_log(f"Warning: No path from goal to discharge dock (will retry periodically)")
+                                self.last_pathfind_retry_time = current_time  # Set retry timer
                                 return False
                         else:
                             debug_log(f"Warning: No discharge dock found")
@@ -942,6 +948,9 @@ class Robot:
                             self.delivery_path = path[1:]
                             self.delivery_path_index = 0
                             self.statistics['cells_to_current_goal'] = len(path) - 1  # Exclude start cell
+                            # Reset retry counter on success
+                            if next_goal in self.goal_retry_attempts:
+                                del self.goal_retry_attempts[next_goal]
                             # Calculate priority number (1-based, first goal is priority 1)
                             # Priority = total initial goals - remaining goals + 1
                             total_initial_goals = len(self.warehouse.goals) + len(self.goals_to_deliver) if self.warehouse else len(self.goals_to_deliver)
@@ -949,15 +958,51 @@ class Robot:
                             debug_log(f"Planned path to goal {next_goal} (priority {priority}): {len(self.delivery_path)} steps")
                             return False
                         else:
-                            debug_log(f"Warning: No path to goal {next_goal}, removing from list")
-                            self.goals_to_deliver.remove(next_goal)
-                            return False
+                            # Pathfinding failed - retry with cooldown instead of removing
+                            if current_time - self.last_pathfind_retry_time >= self.pathfind_retry_cooldown:
+                                # Increment retry counter
+                                if next_goal not in self.goal_retry_attempts:
+                                    self.goal_retry_attempts[next_goal] = 0
+                                self.goal_retry_attempts[next_goal] += 1
+                                self.last_pathfind_retry_time = current_time
+                                
+                                # Only remove goal after max retry attempts
+                                if self.goal_retry_attempts[next_goal] >= self.max_goal_retry_attempts:
+                                    debug_log(f"Warning: No path to goal {next_goal} after {self.max_goal_retry_attempts} attempts, removing from list")
+                                    self.goals_to_deliver.remove(next_goal)
+                                    del self.goal_retry_attempts[next_goal]
+                                    return False
+                                else:
+                                    debug_log(f"Warning: No path to goal {next_goal} (attempt {self.goal_retry_attempts[next_goal]}/{self.max_goal_retry_attempts}), will retry...")
+                                    return False
+                            else:
+                                # Still in cooldown, wait
+                                return False
                 
                 # Check if we're at discharge dock (dropoff mode)
                 elif self.delivery_mode == "DROPOFF" and self.has_cargo:
                     discharge_dock = self.warehouse.discharge_dock
                     if discharge_dock:
                         dock_x, dock_y = discharge_dock[0], discharge_dock[1]
+                        # If we have no path and we're not at the dock, retry pathfinding
+                        if not self.delivery_path:
+                            # Retry pathfinding with cooldown to avoid excessive attempts
+                            if current_time - self.last_pathfind_retry_time >= self.pathfind_retry_cooldown:
+                                self.last_pathfind_retry_time = current_time
+                                path = self.astar_cached(current_pos, discharge_dock, allow_goals=True)
+                                if path and len(path) > 1:
+                                    self.delivery_path = path[1:]
+                                    self.delivery_path_index = 0
+                                    self.statistics['cells_to_current_dock'] = len(path) - 1
+                                    debug_log(f"Retried pathfinding to discharge dock: {len(self.delivery_path)} steps")
+                                    return False
+                                else:
+                                    debug_log(f"Retry: Still no path from {current_pos} to discharge dock (waiting for obstacles to clear...)")
+                                    return False
+                            else:
+                                # Still in cooldown, wait
+                                return False
+                        
                         if abs(self.x - dock_x) < 0.5 and abs(self.y - dock_y) < 0.5:
                             # Drop cargo
                             self.has_cargo = False
@@ -1015,14 +1060,34 @@ class Robot:
                                     self.delivery_path = path[1:]
                                     self.delivery_path_index = 0
                                     self.statistics['cells_to_current_goal'] = len(path) - 1
+                                    # Reset retry counter on success
+                                    if next_goal in self.goal_retry_attempts:
+                                        del self.goal_retry_attempts[next_goal]
                                     total_initial_goals = len(self.warehouse.goals) + len(self.goals_to_deliver) if self.warehouse else len(self.goals_to_deliver)
                                     priority = total_initial_goals - len(self.goals_to_deliver) + 1
                                     debug_log(f"Planned path to next goal {next_goal} (priority {priority}): {len(self.delivery_path)} steps")
                                     return False
                                 else:
-                                    debug_log(f"Warning: No path to next goal {next_goal}, removing from list")
-                                    self.goals_to_deliver.remove(next_goal)
-                                    return False
+                                    # Pathfinding failed - retry with cooldown instead of removing
+                                    if current_time - self.last_pathfind_retry_time >= self.pathfind_retry_cooldown:
+                                        # Increment retry counter
+                                        if next_goal not in self.goal_retry_attempts:
+                                            self.goal_retry_attempts[next_goal] = 0
+                                        self.goal_retry_attempts[next_goal] += 1
+                                        self.last_pathfind_retry_time = current_time
+                                        
+                                        # Only remove goal after max retry attempts
+                                        if self.goal_retry_attempts[next_goal] >= self.max_goal_retry_attempts:
+                                            debug_log(f"Warning: No path to next goal {next_goal} after {self.max_goal_retry_attempts} attempts, removing from list")
+                                            self.goals_to_deliver.remove(next_goal)
+                                            del self.goal_retry_attempts[next_goal]
+                                            return False
+                                        else:
+                                            debug_log(f"Warning: No path to next goal {next_goal} (attempt {self.goal_retry_attempts[next_goal]}/{self.max_goal_retry_attempts}), will retry...")
+                                            return False
+                                    else:
+                                        # Still in cooldown, wait
+                                        return False
                             else:
                                 # All goals delivered - print statistics
                                 if self.statistics['start_time'] is not None:
@@ -1143,6 +1208,8 @@ class Robot:
         self.delivery_path_index = 0
         self.delivery_mode = "PICKUP"
         self.goals_to_deliver = []
+        self.last_pathfind_retry_time = 0
+        self.goal_retry_attempts = {}  # Reset retry attempts
         
         # Reset path cache
         self.path_cache = {}
