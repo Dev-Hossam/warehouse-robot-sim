@@ -30,7 +30,7 @@ def manhattan_distance(x1, y1, x2, y2):
     return abs(x2 - x1) + abs(y2 - y1)
 
 
-def is_traversable(x, y, ogm, allow_goals=True):
+def is_traversable(x, y, ogm, allow_goals=True, allow_unknown=False):
     """Check if a cell is traversable for pathfinding."""
     if not (0 <= x < WAREHOUSE_WIDTH and 0 <= y < WAREHOUSE_HEIGHT):
         return False
@@ -41,9 +41,9 @@ def is_traversable(x, y, ogm, allow_goals=True):
     if cell_state == OCCUPIED:
         return False
     
-    # UNKNOWN cells are not traversable (should be explored first)
+    # UNKNOWN cells: allow traversal if allow_unknown=True (for pathfinding to known destinations)
     if cell_state == UNKNOWN:
-        return False
+        return allow_unknown
     
     # FREE cells are always traversable
     if cell_state == FREE:
@@ -56,7 +56,7 @@ def is_traversable(x, y, ogm, allow_goals=True):
     return False
 
 
-def astar(start, target, ogm, allow_goals=True):
+def astar(start, target, ogm, allow_goals=True, allow_unknown=False):
     """
     A* pathfinding from start to target using the occupancy grid map.
     
@@ -65,6 +65,8 @@ def astar(start, target, ogm, allow_goals=True):
         target: (x, y) target position in grid coordinates
         ogm: OccupancyGridMap to check obstacles
         allow_goals: If True, GOAL cells are traversable (default: True)
+        allow_unknown: If True, UNKNOWN cells are traversable (default: False)
+                       Use True when pathfinding to known destinations like discharge dock
         
     Returns:
         list: Path as list of (x, y) tuples, or None if unreachable
@@ -76,22 +78,22 @@ def astar(start, target, ogm, allow_goals=True):
     sx, sy = start
     tx, ty = target
     
-    debug_print(f"A* planning from ({sx}, {sy}) to ({tx}, {ty})")
+    debug_print(f"A* planning from ({sx}, {sy}) to ({tx}, {ty}) (allow_unknown={allow_unknown})")
     
     # Check if positions are valid and traversable
-    if not is_traversable(sx, sy, ogm, allow_goals):
+    if not is_traversable(sx, sy, ogm, allow_goals, allow_unknown):
         debug_print(f"A* start position ({sx}, {sy}) is not traversable")
         start_state = ogm.get_cell_state(sx, sy) if (0 <= sx < WAREHOUSE_WIDTH and 0 <= sy < WAREHOUSE_HEIGHT) else "OUT_OF_BOUNDS"
         debug_print(f"  Start cell state: {start_state}")
-        if start_state == UNKNOWN:
+        if start_state == UNKNOWN and not allow_unknown:
             debug_print(f"  ERROR: Start position is UNKNOWN - exploration incomplete!")
         return None
     
-    if not is_traversable(tx, ty, ogm, allow_goals):
+    if not is_traversable(tx, ty, ogm, allow_goals, allow_unknown):
         debug_print(f"A* target position ({tx}, {ty}) is not traversable")
         target_state = ogm.get_cell_state(tx, ty) if (0 <= tx < WAREHOUSE_WIDTH and 0 <= ty < WAREHOUSE_HEIGHT) else "OUT_OF_BOUNDS"
         debug_print(f"  Target cell state: {target_state}")
-        if target_state == UNKNOWN:
+        if target_state == UNKNOWN and not allow_unknown:
             debug_print(f"  ERROR: Target position is UNKNOWN - exploration incomplete!")
         return None
     
@@ -137,7 +139,7 @@ def astar(start, target, ogm, allow_goals=True):
                 continue
             
             # Check if neighbor is traversable
-            if not is_traversable(nx, ny, ogm, allow_goals):
+            if not is_traversable(nx, ny, ogm, allow_goals, allow_unknown):
                 continue
             
             # Calculate tentative g-score

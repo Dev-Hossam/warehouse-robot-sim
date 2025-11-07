@@ -21,7 +21,7 @@ def debug_print(message):
 class Warehouse:
     """Warehouse environment with obstacles, goals, and docks."""
     
-    def __init__(self, map_name='map1'):
+    def __init__(self, map_name='map1', num_dynamic_obstacles=0, obstacle_speed=350):
         self.obstacles = set()
         self.goals = []
         self.loading_dock = None
@@ -29,12 +29,19 @@ class Warehouse:
         self.width = WAREHOUSE_WIDTH
         self.height = WAREHOUSE_HEIGHT
         self.map_name = map_name
+        self.num_dynamic_obstacles = num_dynamic_obstacles  # Number of dynamic obstacles to spawn
+        self.obstacle_speed = obstacle_speed  # Movement cooldown in milliseconds for dynamic obstacles
         self.dynamic_obstacles = []  # List of dynamic obstacles
         self.dynamic_obstacles_spawned = False  # Flag to track spawning
+        # Performance optimization: cache background surface
+        self.background_surface = None  # Cached background (grid + explored/unexplored cells)
+        self.last_explored_cells = set()  # Track exploration changes
         debug_log(f"Creating warehouse layout: {map_name}...")
         self.create_maze_layout(map_name)
         self.create_docks_and_goals(map_name)
         debug_log(f"Warehouse created with {len(self.obstacles)} obstacles and {len(self.goals)} goals")
+        if num_dynamic_obstacles > 0:
+            debug_log(f"Dynamic obstacles will be spawned: {num_dynamic_obstacles}")
     
     def create_maze_layout(self, map_name='map1'):
         """Create the maze layout with obstacles based on map name."""
@@ -317,6 +324,15 @@ class Warehouse:
         if self.goals:
             excluded_positions.update(self.goals)
         
+        # Also exclude cells within 2 cells of discharge dock (Manhattan distance)
+        if self.discharge_dock:
+            dock_x, dock_y = self.discharge_dock
+            for cell in free_cells[:]:  # Use slice to create a copy for iteration
+                cell_x, cell_y = cell
+                distance = abs(cell_x - dock_x) + abs(cell_y - dock_y)
+                if distance <= 2:
+                    excluded_positions.add(cell)
+        
         free_cells = [cell for cell in free_cells if cell not in excluded_positions]
         
         if len(free_cells) < num_obstacles:
@@ -336,11 +352,11 @@ class Warehouse:
             while attempts < max_attempts:
                 candidate = random.choice(free_cells)
                 if candidate not in spawned_positions:
-                    # Create obstacle
+                    # Create obstacle with specified speed
                     if obs_type == 'worker':
-                        obstacle = Worker(candidate[0], candidate[1], warehouse=self)
+                        obstacle = Worker(candidate[0], candidate[1], warehouse=self, move_cooldown=self.obstacle_speed)
                     else:  # forklift
-                        obstacle = Forklift(candidate[0], candidate[1], warehouse=self)
+                        obstacle = Forklift(candidate[0], candidate[1], warehouse=self, move_cooldown=self.obstacle_speed)
                     
                     self.dynamic_obstacles.append(obstacle)
                     spawned_positions.add(candidate)
@@ -360,24 +376,39 @@ class Warehouse:
         """Draw the warehouse grid, obstacles, goals, and docks."""
         from constants import SCREEN_WIDTH, SCREEN_HEIGHT, WHITE, DARK_GRAY
         
-        # Draw background - dark for unexplored, light for explored
-        # First draw all cells as dark (unexplored)
-        for y in range(WAREHOUSE_HEIGHT):
-            for x in range(WAREHOUSE_WIDTH):
-                cell_x = x * GRID_SIZE
-                cell_y = y * GRID_SIZE
-                # Dark gray for unexplored cells
-                if robot.ogm and not robot.ogm.is_explored(x, y):
-                    pygame.draw.rect(surface, DARK_GRAY, (cell_x, cell_y, GRID_SIZE, GRID_SIZE))
-                else:
-                    # Light/white for explored cells
-                    pygame.draw.rect(surface, WHITE, (cell_x, cell_y, GRID_SIZE, GRID_SIZE))
+        # Performance optimization: only redraw background when exploration state changes
+        current_explored = robot.ogm.explored_cells if robot.ogm else set()
+        needs_redraw = (self.background_surface is None or 
+                        current_explored != self.last_explored_cells)
         
-        # Draw grid lines
-        for x in range(0, SCREEN_WIDTH, GRID_SIZE):
-            pygame.draw.line(surface, GRAY, (x, 0), (x, SCREEN_HEIGHT), 1)
-        for y in range(0, SCREEN_HEIGHT, GRID_SIZE):
-            pygame.draw.line(surface, GRAY, (0, y), (SCREEN_WIDTH, y), 1)
+        if needs_redraw:
+            # Create/recreate background surface
+            self.background_surface = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT))
+            
+            # Draw background - dark for unexplored, light for explored
+            for y in range(WAREHOUSE_HEIGHT):
+                for x in range(WAREHOUSE_WIDTH):
+                    cell_x = x * GRID_SIZE
+                    cell_y = y * GRID_SIZE
+                    # Dark gray for unexplored cells
+                    if robot.ogm and not robot.ogm.is_explored(x, y):
+                        pygame.draw.rect(self.background_surface, DARK_GRAY, 
+                                       (cell_x, cell_y, GRID_SIZE, GRID_SIZE))
+                    else:
+                        # Light/white for explored cells
+                        pygame.draw.rect(self.background_surface, WHITE, 
+                                       (cell_x, cell_y, GRID_SIZE, GRID_SIZE))
+            
+            # Draw grid lines (static)
+            for x in range(0, SCREEN_WIDTH, GRID_SIZE):
+                pygame.draw.line(self.background_surface, GRAY, (x, 0), (x, SCREEN_HEIGHT), 1)
+            for y in range(0, SCREEN_HEIGHT, GRID_SIZE):
+                pygame.draw.line(self.background_surface, GRAY, (0, y), (SCREEN_WIDTH, y), 1)
+            
+            self.last_explored_cells = current_explored.copy()
+        
+        # Blit cached background (very fast!)
+        surface.blit(self.background_surface, (0, 0))
         
         # Draw loading dock
         if self.loading_dock:

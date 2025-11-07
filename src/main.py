@@ -13,6 +13,7 @@ from constants import (
 )
 from robot import Robot
 from warehouse import Warehouse
+from metrics import save_metrics_to_csv, get_next_run_number
 
 # Parse command-line arguments
 parser = argparse.ArgumentParser(description='Warehouse Robot Simulation')
@@ -23,6 +24,12 @@ parser.add_argument('--algo', type=str, default='A*',
 parser.add_argument('--map', type=str, default='map1',
                     choices=['map1', 'map2', 'map3', 'map4'],
                     help='Map configuration to use (default: map1)')
+parser.add_argument('--obj', type=int, default=0,
+                    help='Number of dynamic obstacles to spawn (default: 0, only spawns for map4 if not specified)')
+parser.add_argument('--robot-speed', type=int, default=100,
+                    help='Robot movement cooldown in milliseconds (default: 100ms, lower = faster)')
+parser.add_argument('--obstacle-speed', type=int, default=350,
+                    help='Dynamic obstacle movement cooldown in milliseconds (default: 350ms, lower = faster)')
 args = parser.parse_args()
 
 # Normalize algorithm name (robot expects: 'A*', 'DIJKSTRA', 'RRT', 'PRM')
@@ -49,9 +56,13 @@ debug_log("=" * 50)
 debug_log(f"INITIALIZING WAREHOUSE ROBOT SIMULATION WITH DFS EXPLORATION")
 debug_log(f"Map: {args.map.upper()}")
 debug_log(f"Pathfinding Algorithm: {algorithm}")
+if args.obj > 0:
+    debug_log(f"Dynamic Obstacles: {args.obj}")
+debug_log(f"Robot Speed: {args.robot_speed}ms cooldown")
+debug_log(f"Obstacle Speed: {args.obstacle_speed}ms cooldown")
 debug_log("=" * 50)
-warehouse = Warehouse(map_name=args.map)
-robot = Robot(1, 1, warehouse=warehouse, pathfinding_algorithm=algorithm)
+warehouse = Warehouse(map_name=args.map, num_dynamic_obstacles=args.obj, obstacle_speed=args.obstacle_speed)
+robot = Robot(1, 1, warehouse=warehouse, pathfinding_algorithm=algorithm, move_cooldown=args.robot_speed)
 
 # Start autonomous mapping phase
 debug_log("")
@@ -72,62 +83,68 @@ while running:
             if event.key == pygame.K_ESCAPE:
                 running = False
     
-    # Update robot rotation
-    robot.update_rotation(current_time)
+    # Check mission status
+    mission_complete = len(warehouse.goals) == 0 and robot.mapping_complete and not robot.is_mapping
     
-    # Spawn dynamic obstacles for map4 when robot enters DELIVER_GOALS mode
-    if robot.exploration_mode == "DELIVER_GOALS" and warehouse.map_name == 'map4':
+    # Update robot rotation (only if mission not complete)
+    if not mission_complete:
+        robot.update_rotation(current_time)
+    
+    # Spawn dynamic obstacles when robot enters DELIVER_GOALS mode (if num_dynamic_obstacles > 0)
+    if robot.exploration_mode == "DELIVER_GOALS" and warehouse.num_dynamic_obstacles > 0:
         if not warehouse.dynamic_obstacles_spawned:
-            warehouse.spawn_dynamic_obstacles(num_obstacles=8)
+            warehouse.spawn_dynamic_obstacles(num_obstacles=warehouse.num_dynamic_obstacles)
     
-    # Update dynamic obstacles (only if spawned)
-    if warehouse.dynamic_obstacles_spawned:
+    # Update dynamic obstacles (only if spawned and mission not complete)
+    if warehouse.dynamic_obstacles_spawned and not mission_complete:
         warehouse.update_dynamic_obstacles(current_time)
     
-    # Update local map with dynamic obstacles and apply temporal decay
-    robot.update_local_map_with_dynamics(current_time)
+    # Update local map with dynamic obstacles and apply temporal decay (only if mission not complete)
+    if not mission_complete:
+        robot.update_local_map_with_dynamics(current_time)
     
-    # Handle mapping phase or normal gameplay
-    if robot.is_mapping:
-        # Check if path needs replanning due to dynamic obstacles
-        robot.replan_if_needed(current_time)
-        
-        # Autonomous mapping phase - robot explores using DFS coverage
-        robot.explore_next(current_time)
-        
-        # Periodic pose graph optimization (reduced frequency from 4s to 8s, only when needed)
-        frame_count = pygame.time.get_ticks() // (1000 // 60)
-        optimization_interval = 480  # Optimize every 480 frames (8 seconds at 60 FPS, reduced from 240 frames/4s)
-        # Only optimize when needed (e.g., after loop closure detected)
-        if frame_count % optimization_interval == 0 and robot.loop_closure_detected:
-            # Convert warehouse obstacles to format for optimization
-            obstacles = []
-            for obs_x, obs_y in warehouse.obstacles:
-                obstacles.append((obs_x, obs_y))
-            robot.isam.optimize_graph(obstacles, recent_nodes=10)
-    else:
-        # Normal gameplay - only allow manual control after mapping is complete
-        if robot.mapping_complete:
+    # Handle mapping phase or normal gameplay (only if mission not complete)
+    if not mission_complete:
+        if robot.is_mapping:
             # Check if path needs replanning due to dynamic obstacles
             robot.replan_if_needed(current_time)
             
-            # Handle continuous input
-            keys = pygame.key.get_pressed()
-            robot.handle_input(keys, warehouse, current_time)
+            # Autonomous mapping phase - robot explores using DFS coverage
+            robot.explore_next(current_time)
             
-            # Check for pickup (space bar)
-            if keys[pygame.K_SPACE]:
-                if not robot.has_cargo:
-                    robot.try_pickup(warehouse, current_time)
-            
-            # Check for drop (V key)
-            if keys[pygame.K_v]:
-                if robot.has_cargo:
-                    robot.try_drop(warehouse, current_time)
-            
-            # Auto-select closest goal if none selected
-            if robot.current_goal is None and warehouse.goals:
-                robot.current_goal = warehouse.goals[0]
+            # Periodic pose graph optimization (reduced frequency from 4s to 8s, only when needed)
+            frame_count = pygame.time.get_ticks() // (1000 // 60)
+            optimization_interval = 480  # Optimize every 480 frames (8 seconds at 60 FPS, reduced from 240 frames/4s)
+            # Only optimize when needed (e.g., after loop closure detected)
+            if frame_count % optimization_interval == 0 and robot.loop_closure_detected:
+                # Convert warehouse obstacles to format for optimization
+                obstacles = []
+                for obs_x, obs_y in warehouse.obstacles:
+                    obstacles.append((obs_x, obs_y))
+                robot.isam.optimize_graph(obstacles, recent_nodes=10)
+        else:
+            # Normal gameplay - only allow manual control after mapping is complete
+            if robot.mapping_complete:
+                # Check if path needs replanning due to dynamic obstacles
+                robot.replan_if_needed(current_time)
+                
+                # Handle continuous input
+                keys = pygame.key.get_pressed()
+                robot.handle_input(keys, warehouse, current_time)
+                
+                # Check for pickup (space bar)
+                if keys[pygame.K_SPACE]:
+                    if not robot.has_cargo:
+                        robot.try_pickup(warehouse, current_time)
+                
+                # Check for drop (V key)
+                if keys[pygame.K_v]:
+                    if robot.has_cargo:
+                        robot.try_drop(warehouse, current_time)
+                
+                # Auto-select closest goal if none selected
+                if robot.current_goal is None and warehouse.goals:
+                    robot.current_goal = warehouse.goals[0]
     
     # Clear screen
     screen.fill(WHITE)
@@ -150,120 +167,72 @@ while running:
             2
         )
     
-    # Draw instructions and status
-    font = pygame.font.Font(None, 24)
-    if robot.is_mapping:
-        text = font.render("DFS COVERAGE EXPLORATION IN PROGRESS...", True, RED)
-        screen.blit(text, (10, 10))
-        
-        # Get exploration status
-        explored_count = len(robot.visited) if hasattr(robot, 'visited') else 0
-        total_free = len(warehouse.get_free_cells())
-        stack_size = len(robot.stack) if hasattr(robot, 'stack') else 0
-        
-        mapping_status = font.render(
-            f"Visited: {explored_count}/{total_free} | Stack: {stack_size} | Mode: {robot.exploration_mode}",
-            True, BLACK
-        )
-        screen.blit(mapping_status, (10, 35))
-        
-        # iSAM pose information
-        estimated_pose = robot.isam.get_estimated_pose()
-        uncertainty = robot.isam.get_uncertainty()
-        robot_pos = font.render(
-            f"Actual: ({int(robot.x)}, {int(robot.y)}) | Est: ({estimated_pose[0]:.1f}, {estimated_pose[1]:.1f}) | Angle: {int(robot.rotation_angle)}°",
-            True, BLACK
-        )
-        screen.blit(robot_pos, (10, 60))
-        
-        isam_status = font.render(
-            f"Uncertainty: {uncertainty[0]:.3f} | Loop Closure: {'DETECTED' if robot.loop_closure_detected else 'None'}",
-            True, BLACK
-        )
-        screen.blit(isam_status, (10, 85))
-        
-        # Show mapping progress
-        progress = explored_count / total_free * 100 if total_free > 0 else 0
-        progress_text = font.render(
-            f"Mapping Progress: {progress:.1f}% ({explored_count}/{total_free} cells)",
-            True, BLACK
-        )
-        screen.blit(progress_text, (10, 110))
-        
-        # Show DFS status, return status, or delivery status
-        if robot.exploration_mode == "RETURN_TO_START":
-            if hasattr(robot, 'return_path') and robot.return_path:
-                remaining = len(robot.return_path) - robot.return_path_index
-                return_text = font.render(
-                    f"RETURNING TO START: {remaining} steps remaining",
-                    True, GREEN
-                )
-                screen.blit(return_text, (10, 135))
-        elif robot.exploration_mode == "DELIVER_GOALS":
-            if hasattr(robot, 'goals_to_deliver'):
-                goals_remaining = len(robot.goals_to_deliver)
-                goals_total = len(warehouse.goals) + goals_remaining if warehouse.goals else goals_remaining
-                delivery_text = font.render(
-                    f"DELIVERING GOALS: {goals_remaining} remaining | Mode: {robot.delivery_mode} | Score: {robot.score}",
-                    True, GREEN
-                )
-                screen.blit(delivery_text, (10, 135))
-                if hasattr(robot, 'delivery_path') and robot.delivery_path:
-                    remaining = len(robot.delivery_path) - robot.delivery_path_index
-                    path_text = font.render(
-                        f"Path steps remaining: {remaining}",
-                        True, BLACK
-                    )
-                    screen.blit(path_text, (10, 160))
-        elif hasattr(robot, 'stack') and robot.stack:
-            dfs_text = font.render(
-                f"DFS Stack: {len(robot.stack)} cells | Backtracking when needed",
+    # Draw status information (player-facing only)
+    font = pygame.font.Font(None, 36)
+    
+    # Check mission status
+    mission_complete = len(warehouse.goals) == 0 and robot.mapping_complete and not robot.is_mapping
+    
+    if not mission_complete:
+        # Show mapping progress during exploration
+        if robot.is_mapping:
+            explored_count = len(robot.visited) if hasattr(robot, 'visited') else 0
+            total_free = len(warehouse.get_free_cells())
+            progress = explored_count / total_free * 100 if total_free > 0 else 0
+            
+            progress_text = font.render(
+                f"Mapping Progress: {progress:.1f}% ({explored_count}/{total_free} cells)",
                 True, BLACK
             )
-            screen.blit(dfs_text, (10, 135))
-    else:
-        text = font.render("Arrow Keys: Move | Space: Pickup | V: Drop | ESC: Quit", True, BLACK)
-        screen.blit(text, (10, 10))
-        
-        # iSAM pose information
-        estimated_pose = robot.isam.get_estimated_pose()
-        uncertainty = robot.isam.get_uncertainty()
-        robot_pos = font.render(
-            f"Actual: ({int(robot.x)}, {int(robot.y)}) | Est: ({estimated_pose[0]:.1f}, {estimated_pose[1]:.1f}) | Cargo: {'Yes' if robot.has_cargo else 'No'} | Angle: {int(robot.rotation_angle)}°",
-            True, BLACK
-        )
-        screen.blit(robot_pos, (10, 35))
-        
-        status = font.render(
-            f"Goals Remaining: {len(warehouse.goals)} | Score: {robot.score} | Uncertainty: {uncertainty[0]:.3f}",
-            True, BLACK
-        )
-        screen.blit(status, (10, 60))
-        
-        if robot.loop_closure_detected:
-            loop_text = font.render("LOOP CLOSURE DETECTED!", True, (255, 0, 255))
-            screen.blit(loop_text, (10, 85))
-        
-        if robot.mapping_complete:
-            mapping_done = font.render("MAPPING COMPLETE - All obstacles and goals identified!", True, GREEN)
-            screen.blit(mapping_done, (10, 110))
+            screen.blit(progress_text, (10, 10))
+            
+            # Show discovered goals counter during exploration
+            discovered_goals = len(robot.ogm.goals) if robot.ogm else 0
+            goals_text = font.render(
+                f"Goals Discovered: {discovered_goals}",
+                True, BLACK
+            )
+            screen.blit(goals_text, (10, 50))
+        else:
+            # Show goals remaining and score after mapping is complete
+            goals_remaining = len(warehouse.goals)
+            if hasattr(robot, 'goals_to_deliver') and robot.goals_to_deliver:
+                goals_remaining = len(robot.goals_to_deliver)
+            
+            status_text = font.render(
+                f"Goals Remaining: {goals_remaining} | Score: {robot.score}",
+                True, BLACK
+            )
+            screen.blit(status_text, (10, 10))
+            
+            # Show cargo status if applicable
+            if robot.mapping_complete:
+                cargo_text = font.render(
+                    f"Cargo: {'Yes' if robot.has_cargo else 'No'}",
+                    True, BLACK
+                )
+                screen.blit(cargo_text, (10, 50))
     
-    # Legend
-    legend_y = SCREEN_HEIGHT - 100
-    legend_font = pygame.font.Font(None, 20)
-    legend1 = legend_font.render("Blue circle = Actual robot position", True, BLACK)
-    screen.blit(legend1, (10, legend_y))
-    legend2 = legend_font.render("Green circle = Estimated pose (iSAM)", True, BLACK)
-    screen.blit(legend2, (10, legend_y + 20))
-    legend3 = legend_font.render("Orange line = Pose error", True, BLACK)
-    screen.blit(legend3, (10, legend_y + 40))
-    legend4 = legend_font.render("Magenta circle = Loop closure detected", True, BLACK)
-    screen.blit(legend4, (10, legend_y + 60))
-    
-    # Show completion message
-    if len(warehouse.goals) == 0:
+    # Show completion message and save metrics
+    if mission_complete:
         victory_text = font.render("MISSION COMPLETE! All packages delivered!", True, GREEN)
-        screen.blit(victory_text, (300, 300))
+        # Center the text
+        text_rect = victory_text.get_rect(center=(SCREEN_WIDTH // 2, SCREEN_HEIGHT // 2))
+        screen.blit(victory_text, text_rect)
+        
+        # Save metrics if not already saved
+        if not hasattr(robot, 'metrics_saved'):
+            # Get metrics from robot
+            metrics_data = robot.get_metrics_for_export()
+            
+            # Get run number
+            run_number = get_next_run_number(algorithm, args.map)
+            
+            # Save metrics to CSV
+            save_metrics_to_csv(algorithm, args.map, run_number, metrics_data)
+            
+            # Mark as saved to avoid saving multiple times
+            robot.metrics_saved = True
     
     # Update display
     pygame.display.flip()

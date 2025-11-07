@@ -256,16 +256,22 @@ class LocalMapper:
                             'confidence': 1.0
                         }
     
-    def update_dynamic_obstacles(self, dynamic_obstacles, current_time):
+    def update_dynamic_obstacles(self, dynamic_obstacles, current_time, robot_pos=None):
         """
         Update local map with dynamic obstacle positions.
         
         Args:
             dynamic_obstacles: List of DynamicObstacle objects
             current_time: Current timestamp in milliseconds
+            robot_pos: Optional (x, y) robot position to exclude from blocking
         """
         # Track which cells are currently occupied by obstacles (actual positions and predictions)
         current_obstacle_cells = set()
+        
+        # Get robot cell position if provided
+        robot_cell = None
+        if robot_pos is not None:
+            robot_cell = (int(robot_pos[0]), int(robot_pos[1]))
         
         # Update obstacle tracker
         for i, obstacle in enumerate(dynamic_obstacles):
@@ -273,15 +279,17 @@ class LocalMapper:
             pos = (obstacle.x, obstacle.y)
             self.obstacle_tracker.update_obstacle_position(obstacle_id, pos, current_time)
             
-            # Mark cell as dynamically occupied
+            # Mark cell as dynamically occupied (but never block robot's current position)
             cell_x, cell_y = int(obstacle.x), int(obstacle.y)
             current_obstacle_cells.add((cell_x, cell_y))
-            self.local_map[(cell_x, cell_y)] = {
-                'state': LOCAL_DYNAMIC_OCCUPIED,
-                'timestamp': current_time,
-                'confidence': 1.0,
-                'obstacle_id': obstacle_id
-            }
+            # Don't mark robot's current position as blocked
+            if robot_cell is None or (cell_x, cell_y) != robot_cell:
+                self.local_map[(cell_x, cell_y)] = {
+                    'state': LOCAL_DYNAMIC_OCCUPIED,
+                    'timestamp': current_time,
+                    'confidence': 1.0,
+                    'obstacle_id': obstacle_id
+                }
             
             # Also mark predicted positions (only if obstacle is moving)
             velocity = self.obstacle_tracker.obstacle_velocities.get(obstacle_id, (0, 0))
@@ -309,8 +317,10 @@ class LocalMapper:
                     if 0 <= pred_x < WAREHOUSE_WIDTH and 0 <= pred_y < WAREHOUSE_HEIGHT:
                         current_obstacle_cells.add((pred_x, pred_y))
                         # Lower confidence for predictions - only mark if not already a static obstacle
-                        if (pred_x, pred_y) not in self.local_map or \
-                           self.local_map[(pred_x, pred_y)].get('state') != LOCAL_OCCUPIED:
+                        # Also don't block robot's current position
+                        if (pred_x, pred_y) != robot_cell and \
+                           ((pred_x, pred_y) not in self.local_map or \
+                            self.local_map[(pred_x, pred_y)].get('state') != LOCAL_OCCUPIED):
                             self.local_map[(pred_x, pred_y)] = {
                                 'state': LOCAL_DYNAMIC_OCCUPIED,
                                 'timestamp': current_time,
@@ -321,11 +331,15 @@ class LocalMapper:
         
         # Clear cells that were marked as dynamic obstacles but are no longer occupied
         # This allows update_from_global_ogm to update them to FREE on the next cycle
+        # Also ensure robot's current position is never blocked
         cells_to_clear = []
         for (x, y), cell_data in list(self.local_map.items()):
             if cell_data.get('state') == LOCAL_DYNAMIC_OCCUPIED:
+                # Always clear robot's current position if it's marked as blocked
+                if robot_cell is not None and (x, y) == robot_cell:
+                    cells_to_clear.append((x, y))
                 # Check if this cell is still occupied by a current obstacle
-                if (x, y) not in current_obstacle_cells:
+                elif (x, y) not in current_obstacle_cells:
                     # Cell is no longer occupied, clear it so it can be updated to FREE
                     cells_to_clear.append((x, y))
         

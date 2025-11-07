@@ -30,7 +30,7 @@ class Robot:
     Robot class with frontier-based exploration and iSAM localization.
     """
     
-    def __init__(self, x, y, ogm=None, warehouse=None, pathfinding_algorithm='A*'):
+    def __init__(self, x, y, ogm=None, warehouse=None, pathfinding_algorithm='A*', move_cooldown=100):
         """
         Initialize the robot.
         
@@ -40,6 +40,7 @@ class Robot:
             ogm: Occupancy Grid Map for mapping
             warehouse: Warehouse object (for validation)
             pathfinding_algorithm: Pathfinding algorithm to use ('A*', 'Dijkstra', 'RRT', 'PRM')
+            move_cooldown: Movement cooldown in milliseconds (default: 100ms)
         """
         # Validate starting position
         if warehouse and warehouse.is_blocked(int(x), int(y)):
@@ -68,7 +69,7 @@ class Robot:
         self.current_goal = None
         self.has_cargo = False
         self.last_move_time = 0
-        self.move_cooldown = 100  # milliseconds between moves (increased speed from 50ms to 25ms)
+        self.move_cooldown = move_cooldown  # milliseconds between moves
         self.last_action_time = 0
         self.action_cooldown = 200  # milliseconds between actions (reduced from 300ms)
         self.score = 0
@@ -156,7 +157,11 @@ class Robot:
             'current_goal_start_time': None,
             'current_goal_start_pos': None,
             'cells_to_current_goal': 0,
-            'cells_to_current_dock': 0
+            'cells_to_current_dock': 0,
+            'actual_cells_to_current_goal': 0,  # Track actual cells traversed
+            'actual_cells_to_current_dock': 0,  # Track actual cells traversed
+            'total_replans': 0,  # Total number of replans during mission
+            'total_pathfinding_cells': 0  # Total cells in ALL paths computed (includes initial paths + all replan paths)
         }
         
         debug_log(f"Robot initialized at ({x}, {y}) with DFS coverage exploration")
@@ -231,9 +236,15 @@ class Robot:
         if not self.local_mapper or not self.warehouse:
             return
         
-        # Update dynamic obstacles if they exist
+        # Update local map from global OGM first (runs every frame, not just on movement)
+        if self.ogm:
+            robot_pos = (self.x, self.y)
+            self.local_mapper.update_from_global_ogm(robot_pos, self.ogm, self.warehouse)
+        
+        # Update dynamic obstacles if they exist (exclude robot's current position from blocking)
         if hasattr(self.warehouse, 'dynamic_obstacles') and self.warehouse.dynamic_obstacles:
-            self.local_mapper.update_dynamic_obstacles(self.warehouse.dynamic_obstacles, current_time)
+            robot_pos = (self.x, self.y)
+            self.local_mapper.update_dynamic_obstacles(self.warehouse.dynamic_obstacles, current_time, robot_pos=robot_pos)
         
         # Apply temporal decay
         self.local_mapper.decay_observations(current_time)
@@ -267,6 +278,18 @@ class Robot:
         # Calculate movement delta
         dx = new_x - self.x
         dy = new_y - self.y
+        
+        # Track actual cells traversed during goal delivery
+        if hasattr(self, 'exploration_mode') and self.exploration_mode == "DELIVER_GOALS":
+            if hasattr(self, 'delivery_mode'):
+                if self.delivery_mode == "PICKUP" and hasattr(self, 'has_cargo') and not self.has_cargo:
+                    # Moving to goal - increment actual cells
+                    if hasattr(self, 'statistics') and 'actual_cells_to_current_goal' in self.statistics:
+                        self.statistics['actual_cells_to_current_goal'] += 1
+                elif self.delivery_mode == "DROPOFF" and hasattr(self, 'has_cargo') and self.has_cargo:
+                    # Moving to dock - increment actual cells
+                    if hasattr(self, 'statistics') and 'actual_cells_to_current_dock' in self.statistics:
+                        self.statistics['actual_cells_to_current_dock'] += 1
         
         # Move robot
         self.x = new_x
@@ -441,24 +464,34 @@ class Robot:
                 # Determine target based on delivery mode
                 if self.delivery_mode == "PICKUP" and self.goals_to_deliver:
                     target = self.goals_to_deliver[0]
+                    # Check if goal is discovered
+                    goal_discovered = target in self.ogm.goals if self.ogm else False
+                    allow_unknown = goal_discovered
                 elif self.delivery_mode == "DROPOFF" and self.warehouse and self.warehouse.discharge_dock:
                     target = self.warehouse.discharge_dock
+                    # Always allow UNKNOWN when pathfinding to known discharge dock
+                    allow_unknown = True
                 else:
                     return False
                 
                 # Clear path cache for this route to force fresh pathfinding
-                cache_key = (current_pos, target, True, self.pathfinding_algorithm)
+                cache_key = (current_pos, target, True, allow_unknown, self.pathfinding_algorithm)
                 if cache_key in self.path_cache:
                     del self.path_cache[cache_key]
                 
                 # Replan path
-                path = self.pathfind_cached(current_pos, target, allow_goals=True)
+                path = self.pathfind_cached(current_pos, target, allow_goals=True, allow_unknown=allow_unknown)
                 if path and len(path) > 1:
+                    # Track replan (pathfinding cells are already tracked in pathfind_cached)
+                    self.statistics['total_replans'] += 1
+                    
                     # Validate new path before accepting it
                     is_valid, new_blocking = self.check_path_validity(path)
                     if is_valid:
                         self.delivery_path = path[1:]
                         self.delivery_path_index = 0
+                        # Update current_path for visualization (include current position + delivery_path)
+                        self.current_path = [current_pos] + self.delivery_path if self.delivery_path else []
                         self.last_replan_time = current_time
                         self.replan_counter = 0  # Reset counter on successful replan
                         debug_log(f"Successfully replanned path: {len(path)} steps")
@@ -467,12 +500,19 @@ class Robot:
                         # New path is also blocked, but accept it anyway (will replan again if needed)
                         self.delivery_path = path[1:]
                         self.delivery_path_index = 0
+                        # Update current_path for visualization (include current position + delivery_path)
+                        self.current_path = [current_pos] + self.delivery_path if self.delivery_path else []
                         self.last_replan_time = current_time
                         debug_log(f"Replanned path still has {len(new_blocking)} blocking cells, but accepting it")
                         return True
                 else:
                     # Pathfinding failed, increment counter
                     debug_log(f"Pathfinding failed, no path found from {current_pos} to {target}")
+                    # Keep current_path synchronized with delivery_path if it still exists
+                    if hasattr(self, 'delivery_path') and self.delivery_path:
+                        self.current_path = [current_pos] + self.delivery_path
+                    else:
+                        self.current_path = []
                     self.last_replan_time = current_time
                     return False
         
@@ -481,13 +521,15 @@ class Robot:
             is_valid, blocking_cells = self.check_path_validity(self.return_path)
             if not is_valid:
                 debug_log(f"Return path blocked by dynamic obstacles at {blocking_cells}, replanning...")
-                # Replan return path
+                # Replan return path (pathfinding cells are tracked in plan_return_to_start -> astar_cached -> pathfind_cached)
                 self.plan_return_to_start()
+                # Track replan
+                self.statistics['total_replans'] += 1
                 return True
         
         return False
     
-    def _integrated_pathfind(self, start, target, allow_goals=True):
+    def _integrated_pathfind(self, start, target, allow_goals=True, allow_unknown=False):
         """
         Integrated pathfinding that checks both global OGM and local mapper.
         Creates a custom traversability function that considers dynamic obstacles.
@@ -496,6 +538,7 @@ class Robot:
             start: (x, y) starting position
             target: (x, y) target position
             allow_goals: If True, GOAL cells are traversable
+            allow_unknown: If True, UNKNOWN cells are traversable (for known destinations)
             
         Returns:
             list: Path as list of (x, y) tuples, or None if unreachable
@@ -548,7 +591,7 @@ class Robot:
         
         # Plan path using selected algorithm with integrated OGM
         if self.pathfinding_algorithm == 'A*':
-            path = astar(start, target, integrated_ogm, allow_goals=allow_goals)
+            path = astar(start, target, integrated_ogm, allow_goals=allow_goals, allow_unknown=allow_unknown)
         elif self.pathfinding_algorithm == 'DIJKSTRA':
             path = dijkstra(start, target, integrated_ogm, allow_goals=allow_goals)
         elif self.pathfinding_algorithm == 'RRT':
@@ -557,11 +600,11 @@ class Robot:
             path = prm(start, target, integrated_ogm, allow_goals=allow_goals)
         else:
             # Fallback to A*
-            path = astar(start, target, integrated_ogm, allow_goals=allow_goals)
+            path = astar(start, target, integrated_ogm, allow_goals=allow_goals, allow_unknown=allow_unknown)
         
         return path
     
-    def pathfind_cached(self, start, target, allow_goals=True):
+    def pathfind_cached(self, start, target, allow_goals=True, allow_unknown=False):
         """
         Pathfinding with caching to avoid redundant calculations.
         Uses the selected pathfinding algorithm (A*, Dijkstra, RRT, or PRM).
@@ -571,12 +614,13 @@ class Robot:
             start: (x, y) starting position
             target: (x, y) target position
             allow_goals: If True, GOAL cells are traversable
+            allow_unknown: If True, UNKNOWN cells are traversable (for known destinations)
             
         Returns:
             list: Path as list of (x, y) tuples, or None if unreachable
         """
         # Check cache first
-        cache_key = (start, target, allow_goals, self.pathfinding_algorithm)
+        cache_key = (start, target, allow_goals, allow_unknown, self.pathfinding_algorithm)
         if cache_key in self.path_cache:
             path = self.path_cache[cache_key]
             # Validate path against local map (check for dynamic obstacles)
@@ -597,7 +641,12 @@ class Robot:
                 return path
         
         # Plan path using selected algorithm with integrated local map checking
-        path = self._integrated_pathfind(start, target, allow_goals)
+        path = self._integrated_pathfind(start, target, allow_goals, allow_unknown)
+        
+        # Track pathfinding cells (cells in computed path)
+        # NOTE: This counts ALL paths computed, including replans, not just final traversed paths
+        if path and len(path) > 1:
+            self.statistics['total_pathfinding_cells'] += len(path) - 1  # Exclude start cell
         
         # Store path for visualization
         self.current_path = path if path else []
@@ -611,11 +660,17 @@ class Robot:
         self.path_cache[cache_key] = path
         return path
     
-    def astar_cached(self, start, target, allow_goals=True):
+    def astar_cached(self, start, target, allow_goals=True, allow_unknown=False):
         """
         Legacy method for backward compatibility - redirects to pathfind_cached.
+        
+        Args:
+            start: (x, y) starting position
+            target: (x, y) target position
+            allow_goals: If True, GOAL cells are traversable
+            allow_unknown: If True, UNKNOWN cells are traversable (for known destinations)
         """
-        return self.pathfind_cached(start, target, allow_goals)
+        return self.pathfind_cached(start, target, allow_goals, allow_unknown)
     
     def astar(self, start, target):
         """
@@ -662,14 +717,18 @@ class Robot:
         debug_log(f"Planning return path from ({current_pos[0]}, {current_pos[1]}) to ({start_pos[0]}, {start_pos[1]})")
         
         # Plan path using cached A* method
-        path = self.astar_cached(current_pos, start_pos, allow_goals=True)
+        # Allow UNKNOWN traversal since start position is a known location
+        path = self.astar_cached(current_pos, start_pos, allow_goals=True, allow_unknown=True)
         
         if path:
             if len(path) > 1:
                 self.return_path = path[1:]  # Skip first cell (current position)
+                # Update current_path for visualization (include current position + return_path)
+                self.current_path = [current_pos] + self.return_path if self.return_path else []
             else:
                 # Already at start or path is just one cell
                 self.return_path = []
+                self.current_path = []
             self.return_path_index = 0
             debug_log(f"Planned return path to start: {len(self.return_path)} steps (path length: {len(path)})")
         else:
@@ -681,6 +740,8 @@ class Robot:
                 debug_log(f"  Current position state: {current_state}, Start position state: {start_state}")
             self.return_path = []
             self.return_path_index = 0
+            # Clear current_path since return path planning failed
+            self.current_path = []
     
     def plan_goal_delivery(self):
         """Initialize goal delivery state with goals in priority order."""
@@ -905,6 +966,11 @@ class Robot:
                         self.current_goal = next_goal
                         self.delivery_mode = "DROPOFF"
                         
+                        # Clear old path immediately to prevent visual artifacts
+                        self.delivery_path = []
+                        self.delivery_path_index = 0
+                        self.current_path = []
+                        
                         # Record statistics for reaching goal
                         if self.statistics['current_goal_start_time'] is not None:
                             time_to_goal = time.time() - self.statistics['current_goal_start_time']
@@ -918,20 +984,33 @@ class Robot:
                         
                         # Start tracking dock delivery
                         self.statistics['current_goal_start_time'] = time.time()
+                        self.statistics['actual_cells_to_current_dock'] = 0  # Reset for dock delivery
                         
                         # Plan path to discharge dock
                         discharge_dock = self.warehouse.discharge_dock
                         if discharge_dock:
-                            path = self.astar_cached(current_pos, discharge_dock, allow_goals=True)
+                            # Allow traversing UNKNOWN cells when pathfinding to known discharge dock
+                            path = self.astar_cached(current_pos, discharge_dock, allow_goals=True, allow_unknown=True)
                             if path and len(path) > 1:
                                 self.delivery_path = path[1:]
                                 self.delivery_path_index = 0
+                                # Update current_path for visualization (include current position + delivery_path)
+                                # Ensure no duplicate points at the start
+                                if self.delivery_path and self.delivery_path[0] == current_pos:
+                                    self.current_path = self.delivery_path.copy()
+                                else:
+                                    self.current_path = [current_pos] + self.delivery_path if self.delivery_path else []
                                 self.statistics['cells_to_current_dock'] = len(path) - 1  # Exclude start cell
                                 self.last_pathfind_retry_time = current_time  # Reset retry timer on success
                                 debug_log(f"Planned path to discharge dock: {len(self.delivery_path)} steps")
                                 return False
                             else:
                                 debug_log(f"Warning: No path from goal to discharge dock (will retry periodically)")
+                                # Keep current_path synchronized with delivery_path if it still exists
+                                if hasattr(self, 'delivery_path') and self.delivery_path:
+                                    self.current_path = [current_pos] + self.delivery_path
+                                else:
+                                    self.current_path = []
                                 self.last_pathfind_retry_time = current_time  # Set retry timer
                                 return False
                         else:
@@ -942,11 +1021,18 @@ class Robot:
                         if self.statistics['current_goal_start_time'] is None:
                             self.statistics['current_goal_start_time'] = time.time()
                             self.statistics['current_goal_start_pos'] = current_pos
+                            self.statistics['actual_cells_to_current_goal'] = 0
+                            self.statistics['actual_cells_to_current_dock'] = 0
                         
-                        path = self.astar_cached(current_pos, next_goal, allow_goals=True)
+                        # Allow traversing UNKNOWN cells when pathfinding to discovered goals
+                        # Check if goal is in OGM (has been discovered)
+                        goal_discovered = next_goal in self.ogm.goals if self.ogm else False
+                        path = self.astar_cached(current_pos, next_goal, allow_goals=True, allow_unknown=goal_discovered)
                         if path and len(path) > 1:
                             self.delivery_path = path[1:]
                             self.delivery_path_index = 0
+                            # Update current_path for visualization (include current position + delivery_path)
+                            self.current_path = [current_pos] + self.delivery_path if self.delivery_path else []
                             self.statistics['cells_to_current_goal'] = len(path) - 1  # Exclude start cell
                             # Reset retry counter on success
                             if next_goal in self.goal_retry_attempts:
@@ -959,6 +1045,11 @@ class Robot:
                             return False
                         else:
                             # Pathfinding failed - retry with cooldown instead of removing
+                            # Keep current_path synchronized with delivery_path if it still exists
+                            if hasattr(self, 'delivery_path') and self.delivery_path:
+                                self.current_path = [current_pos] + self.delivery_path
+                            else:
+                                self.current_path = []
                             if current_time - self.last_pathfind_retry_time >= self.pathfind_retry_cooldown:
                                 # Increment retry counter
                                 if next_goal not in self.goal_retry_attempts:
@@ -989,15 +1080,23 @@ class Robot:
                             # Retry pathfinding with cooldown to avoid excessive attempts
                             if current_time - self.last_pathfind_retry_time >= self.pathfind_retry_cooldown:
                                 self.last_pathfind_retry_time = current_time
-                                path = self.astar_cached(current_pos, discharge_dock, allow_goals=True)
+                                # Allow traversing UNKNOWN cells when pathfinding to known discharge dock
+                                path = self.astar_cached(current_pos, discharge_dock, allow_goals=True, allow_unknown=True)
                                 if path and len(path) > 1:
                                     self.delivery_path = path[1:]
                                     self.delivery_path_index = 0
+                                    # Update current_path for visualization (include current position + delivery_path)
+                                    self.current_path = [current_pos] + self.delivery_path if self.delivery_path else []
                                     self.statistics['cells_to_current_dock'] = len(path) - 1
                                     debug_log(f"Retried pathfinding to discharge dock: {len(self.delivery_path)} steps")
                                     return False
                                 else:
                                     debug_log(f"Retry: Still no path from {current_pos} to discharge dock (waiting for obstacles to clear...)")
+                                    # Keep current_path synchronized with delivery_path if it still exists
+                                    if hasattr(self, 'delivery_path') and self.delivery_path:
+                                        self.current_path = [current_pos] + self.delivery_path
+                                    else:
+                                        self.current_path = []
                                     return False
                             else:
                                 # Still in cooldown, wait
@@ -1020,9 +1119,12 @@ class Robot:
                                 'goal': self.current_goal,
                                 'cells_to_goal': self.statistics['cells_to_current_goal'],
                                 'cells_to_dock': self.statistics['cells_to_current_dock'],
+                                'actual_cells_to_goal': self.statistics['actual_cells_to_current_goal'],
+                                'actual_cells_to_dock': self.statistics['actual_cells_to_current_dock'],
                                 'time_to_goal': self.statistics['time_to_goal'],
                                 'time_to_dock': self.statistics['time_to_dock'],
                                 'total_cells': self.statistics['cells_to_current_goal'] + self.statistics['cells_to_current_dock'],
+                                'actual_total_cells': self.statistics['actual_cells_to_current_goal'] + self.statistics['actual_cells_to_current_dock'],
                                 'total_time': self.statistics['time_to_goal'] + self.statistics['time_to_dock']
                             }
                             self.statistics['goals'].append(goal_stat)
@@ -1046,6 +1148,8 @@ class Robot:
                             self.statistics['current_goal_start_pos'] = None
                             self.statistics['cells_to_current_goal'] = 0
                             self.statistics['cells_to_current_dock'] = 0
+                            self.statistics['actual_cells_to_current_goal'] = 0
+                            self.statistics['actual_cells_to_current_dock'] = 0
                             
                             # Check if more goals to deliver
                             if self.goals_to_deliver:
@@ -1053,12 +1157,19 @@ class Robot:
                                 current_pos = (int(self.x), int(self.y))
                                 self.statistics['current_goal_start_time'] = time.time()
                                 self.statistics['current_goal_start_pos'] = current_pos
+                                self.statistics['actual_cells_to_current_goal'] = 0
+                                self.statistics['actual_cells_to_current_dock'] = 0
                                 
                                 next_goal = self.goals_to_deliver[0]
-                                path = self.astar_cached(current_pos, next_goal, allow_goals=True)
+                                # Allow traversing UNKNOWN cells when pathfinding to discovered goals
+                                # Check if goal is in OGM (has been discovered)
+                                goal_discovered = next_goal in self.ogm.goals if self.ogm else False
+                                path = self.astar_cached(current_pos, next_goal, allow_goals=True, allow_unknown=goal_discovered)
                                 if path and len(path) > 1:
                                     self.delivery_path = path[1:]
                                     self.delivery_path_index = 0
+                                    # Update current_path for visualization (include current position + delivery_path)
+                                    self.current_path = [current_pos] + self.delivery_path if self.delivery_path else []
                                     self.statistics['cells_to_current_goal'] = len(path) - 1
                                     # Reset retry counter on success
                                     if next_goal in self.goal_retry_attempts:
@@ -1069,6 +1180,11 @@ class Robot:
                                     return False
                                 else:
                                     # Pathfinding failed - retry with cooldown instead of removing
+                                    # Keep current_path synchronized with delivery_path if it still exists
+                                    if hasattr(self, 'delivery_path') and self.delivery_path:
+                                        self.current_path = [current_pos] + self.delivery_path
+                                    else:
+                                        self.current_path = []
                                     if current_time - self.last_pathfind_retry_time >= self.pathfind_retry_cooldown:
                                         # Increment retry counter
                                         if next_goal not in self.goal_retry_attempts:
@@ -1091,8 +1207,7 @@ class Robot:
                             else:
                                 # All goals delivered - print statistics
                                 if self.statistics['start_time'] is not None:
-                                    total_time = time.time() - self.statistics['start_time']
-                                    self.statistics['total_time'] = total_time
+                                    self.statistics['total_time'] = time.time() - self.statistics['start_time']
                                 
                                 debug_log("")
                                 debug_log("=" * 80)
@@ -1105,6 +1220,8 @@ class Robot:
                                 debug_log(f"Total Goals Delivered: {self.statistics['total_goals_delivered']}")
                                 debug_log(f"Total Cells Traversed: {self.statistics['total_cells_traversed']}")
                                 debug_log(f"Total Time: {self.statistics['total_time']:.2f} seconds")
+                                debug_log(f"Total Replans: {self.statistics['total_replans']}")
+                                debug_log(f"Total Pathfinding Cells (all computed paths, incl. replans): {self.statistics['total_pathfinding_cells']}")
                                 debug_log("")
                                 
                                 # Calculate averages
@@ -1113,11 +1230,13 @@ class Robot:
                                     avg_cells_to_goal = sum(g['cells_to_goal'] for g in self.statistics['goals']) / len(self.statistics['goals'])
                                     avg_cells_to_return = sum(g['cells_to_dock'] for g in self.statistics['goals']) / len(self.statistics['goals'])
                                     avg_time_per_goal = self.statistics['total_time'] / self.statistics['total_goals_delivered']
+                                    avg_path_length = sum(g['total_cells'] for g in self.statistics['goals']) / len(self.statistics['goals'])
                                     
                                     debug_log("SUMMARY STATISTICS:")
                                     debug_log(f"  Average cells per goal (total): {avg_cells_per_goal:.1f} cells")
                                     debug_log(f"  Average cells to reach goal: {avg_cells_to_goal:.1f} cells")
                                     debug_log(f"  Average cells to return: {avg_cells_to_return:.1f} cells")
+                                    debug_log(f"  Average path length per goal: {avg_path_length:.1f} cells")
                                     debug_log(f"  Average time per goal: {avg_time_per_goal:.2f} seconds")
                                     debug_log("")
                                 
@@ -1139,6 +1258,7 @@ class Robot:
                                 
                                 debug_log("-" * 80)
                                 debug_log("=" * 80)
+                                
                                 self.is_mapping = False
                                 return False
                 
@@ -1214,6 +1334,27 @@ class Robot:
         # Reset path cache
         self.path_cache = {}
         self.path_cache_max_size = 100
+        
+        # Reset statistics
+        self.statistics = {
+            'goals': [],
+            'total_goals_delivered': 0,
+            'total_cells_traversed': 0,
+            'total_time': 0.0,
+            'start_time': None,
+            'current_goal_start_time': None,
+            'current_goal_start_pos': None,
+            'cells_to_current_goal': 0,
+            'cells_to_current_dock': 0,
+            'actual_cells_to_current_goal': 0,
+            'actual_cells_to_current_dock': 0,
+            'total_replans': 0,
+            'total_pathfinding_cells': 0
+        }
+        
+        # Reset metrics saved flag
+        if hasattr(self, 'metrics_saved'):
+            delattr(self, 'metrics_saved')
         
         # Reset local mapper
         if self.local_mapper:
@@ -1337,6 +1478,31 @@ class Robot:
         if self.local_mapper:
             self._draw_local_map(surface)
         
+        # Update current_path to reflect robot's current position and remaining path
+        # This ensures the visualization stays synchronized even as the robot moves
+        current_pos = (int(self.x), int(self.y))
+        if hasattr(self, 'delivery_path') and self.delivery_path:
+            # Update current_path to show path from current position
+            # Prevent duplicate points at the start
+            if self.delivery_path and self.delivery_path[0] == current_pos:
+                self.current_path = self.delivery_path.copy()
+            else:
+                self.current_path = [current_pos] + self.delivery_path
+        elif hasattr(self, 'return_path') and self.return_path:
+            # Update current_path to show return path from current position
+            # Prevent duplicate points at the start
+            if self.return_path and self.return_path[0] == current_pos:
+                self.current_path = self.return_path.copy()
+            else:
+                self.current_path = [current_pos] + self.return_path
+        else:
+            # No active path, ensure current_path is empty
+            if not hasattr(self, 'current_path'):
+                self.current_path = []
+            elif self.current_path:
+                # Clear current_path if there's no active delivery or return path
+                self.current_path = []
+        
         # Draw planned path (if any) with improved visualization
         if hasattr(self, 'current_path') and self.current_path and len(self.current_path) > 1:
             # Color code by algorithm with transparency effect
@@ -1352,8 +1518,26 @@ class Robot:
                            int(y * GRID_SIZE + GRID_SIZE // 2)) 
                           for x, y in self.current_path]
             if len(path_points) > 1:
-                # Check path validity and highlight blocked segments
-                is_valid, blocking_cells = self.check_path_validity(self.current_path) if self.local_mapper else (True, [])
+                # Performance optimization: cache path validity check (only revalidate every 100ms)
+                if not hasattr(self, '_last_path_validation_time'):
+                    self._last_path_validation_time = 0
+                    self._cached_path_validity = (True, [])
+                    self._cached_path_hash = None
+                
+                current_time = pygame.time.get_ticks()
+                # Create path hash to detect path changes
+                path_hash = hash(tuple(self.current_path))
+                
+                # Revalidate if: time elapsed OR path changed
+                if (current_time - self._last_path_validation_time > 100 or 
+                    path_hash != self._cached_path_hash):
+                    is_valid, blocking_cells = self.check_path_validity(self.current_path) if self.local_mapper else (True, [])
+                    self._cached_path_validity = (is_valid, blocking_cells)
+                    self._last_path_validation_time = current_time
+                    self._cached_path_hash = path_hash
+                else:
+                    is_valid, blocking_cells = self._cached_path_validity
+                
                 blocking_set = set(blocking_cells)
                 
                 # Draw path segments, highlighting blocked ones
@@ -1473,3 +1657,72 @@ class Robot:
             loop_x = int(estimated_pose[0] * GRID_SIZE + GRID_SIZE // 2)
             loop_y = int(estimated_pose[1] * GRID_SIZE + GRID_SIZE // 2)
             pygame.draw.circle(surface, (255, 0, 255), (loop_x, loop_y), GRID_SIZE // 2, 3)
+    
+    def get_metrics_for_export(self):
+        """
+        Get metrics in format suitable for export.
+        Returns comprehensive metrics showing what actually happened vs what was planned.
+        
+        Returns:
+            dict: Dictionary with metrics
+        """
+        total_goals = self.statistics['total_goals_delivered']
+        
+        # Calculate planned (initial) average path length per goal
+        planned_avg_path_length = 0.0
+        if total_goals > 0 and len(self.statistics['goals']) > 0:
+            planned_avg_path_length = sum(g['total_cells'] for g in self.statistics['goals']) / len(self.statistics['goals'])
+        
+        # Calculate actual average path length per goal (actual cells traversed)
+        actual_avg_path_length = 0.0
+        if total_goals > 0 and len(self.statistics['goals']) > 0:
+            actual_avg_path_length = sum(g.get('actual_total_cells', g['total_cells']) for g in self.statistics['goals']) / len(self.statistics['goals'])
+        
+        # Calculate average pathfinding cells per goal (includes all computed paths: initial + replans)
+        avg_pathfinding_cells_per_goal = 0.0
+        if total_goals > 0:
+            avg_pathfinding_cells_per_goal = self.statistics['total_pathfinding_cells'] / total_goals
+        
+        # Calculate average replans per goal
+        avg_replans_per_goal = 0.0
+        if total_goals > 0:
+            avg_replans_per_goal = self.statistics['total_replans'] / total_goals
+        
+        # Get obstacle counts from warehouse
+        total_obstacles = len(self.warehouse.obstacles) if self.warehouse else 0
+        total_dynamic_obstacles = len(self.warehouse.dynamic_obstacles) if (self.warehouse and hasattr(self.warehouse, 'dynamic_obstacles')) else 0
+        
+        # Ensure total_time is calculated
+        if self.statistics['start_time'] is not None and self.statistics['total_time'] == 0.0:
+            self.statistics['total_time'] = time.time() - self.statistics['start_time']
+        
+        # Get speed settings
+        robot_speed = self.move_cooldown
+        obstacle_speed = self.warehouse.obstacle_speed if (self.warehouse and hasattr(self.warehouse, 'obstacle_speed')) else 350
+        
+        return {
+            # Mission summary
+            'total_goals_delivered': total_goals,
+            'total_time': self.statistics['total_time'],
+            'total_obstacles': total_obstacles,
+            'total_dynamic_obstacles': total_dynamic_obstacles,
+            
+            # Speed settings
+            'robot_speed': robot_speed,
+            'obstacle_speed': obstacle_speed,
+            
+            # Actual traversal metrics
+            'total_cells_actually_traversed': self.statistics['total_cells_traversed'],
+            'actual_avg_path_length_per_goal': actual_avg_path_length,
+            
+            # Pathfinding computation metrics (includes replans)
+            'total_pathfinding_cells_computed': self.statistics['total_pathfinding_cells'],
+            'avg_pathfinding_cells_per_goal': avg_pathfinding_cells_per_goal,
+            
+            # Planned metrics (what was initially planned)
+            'planned_avg_path_length_per_goal': planned_avg_path_length,
+            
+            # Replanning metrics
+            'total_replans': self.statistics['total_replans'],
+            'avg_replans_per_goal': avg_replans_per_goal
+        }

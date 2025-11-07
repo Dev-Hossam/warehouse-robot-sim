@@ -11,7 +11,7 @@ from constants import WAREHOUSE_WIDTH, WAREHOUSE_HEIGHT, GRID_SIZE, debug_log
 class DynamicObstacle:
     """Base class for dynamic obstacles (workers and forklifts)."""
     
-    def __init__(self, x, y, obstacle_type='worker', warehouse=None):
+    def __init__(self, x, y, obstacle_type='worker', warehouse=None, move_cooldown=350):
         """
         Initialize a dynamic obstacle.
         
@@ -20,6 +20,7 @@ class DynamicObstacle:
             y: Starting y coordinate (grid cell)
             obstacle_type: Type of obstacle ('worker' or 'forklift')
             warehouse: Warehouse object for collision checking
+            move_cooldown: Movement cooldown in milliseconds (default: 350ms)
         """
         self.x = float(x)
         self.y = float(y)
@@ -29,7 +30,7 @@ class DynamicObstacle:
         # Movement properties
         self.movement_speed = 1  # Grid cells per move
         self.last_move_time = 0
-        self.move_cooldown = 350  # milliseconds between moves (slower than robot)
+        self.move_cooldown = move_cooldown  # milliseconds between moves
         
         # Random movement state
         self.current_direction = None  # (dx, dy) tuple
@@ -57,6 +58,14 @@ class DynamicObstacle:
         # Check warehouse static obstacles
         if self.warehouse and self.warehouse.is_blocked(int(new_x), int(new_y)):
             return False
+        
+        # Prevent obstacles from moving within 2 cells of discharge dock
+        if self.warehouse and self.warehouse.discharge_dock:
+            dock_x, dock_y = self.warehouse.discharge_dock
+            # Calculate Manhattan distance to discharge dock
+            distance = abs(int(new_x) - dock_x) + abs(int(new_y) - dock_y)
+            if distance <= 2:
+                return False
         
         return True
     
@@ -163,13 +172,13 @@ class DynamicObstacle:
 class Worker(DynamicObstacle):
     """Worker dynamic obstacle."""
     
-    def __init__(self, x, y, warehouse=None):
-        super().__init__(x, y, obstacle_type='worker', warehouse=warehouse)
+    def __init__(self, x, y, warehouse=None, move_cooldown=350):
+        super().__init__(x, y, obstacle_type='worker', warehouse=warehouse, move_cooldown=move_cooldown)
 
 
 class Forklift(DynamicObstacle):
     """Forklift dynamic obstacle."""
     
-    def __init__(self, x, y, warehouse=None):
-        super().__init__(x, y, obstacle_type='forklift', warehouse=warehouse)
+    def __init__(self, x, y, warehouse=None, move_cooldown=350):
+        super().__init__(x, y, obstacle_type='forklift', warehouse=warehouse, move_cooldown=move_cooldown)
 
