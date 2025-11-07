@@ -1,5 +1,5 @@
 ================================================================================
-METRICS REPORT - A* on MAP2 - Run #1
+METRICS REPORT - DIJKSTRA on MAP6 - Run #1
 ================================================================================
 
 Metric                                                                      Value
@@ -8,8 +8,8 @@ Metric                                                                      Valu
 MISSION SUMMARY
 --------------------------------------------------------------------------------
 Total Goals Delivered                                                           8
-Total Time Taken (seconds)                                                  46.79
-Total Static Obstacles                                                        158
+Total Time Taken (seconds)                                                  67.73
+Total Static Obstacles                                                        183
 Total Dynamic Obstacles                                                         7
 
 SPEED SETTINGS
@@ -19,19 +19,19 @@ Obstacle Speed (ms cooldown)                                                  40
 
 ACTUAL TRAVERSAL (What Robot Actually Did)
 --------------------------------------------------------------------------------
-Total Cells Actually Traversed                                                314
-Average Path Length per Goal (actual)                                       42.50
+Total Cells Actually Traversed                                                360
+Average Path Length per Goal (actual)                                       53.75
 
 PLANNED vs ACTUAL COMPARISON
 --------------------------------------------------------------------------------
-Planned Avg Path Length per Goal                                            39.25
-Actual Avg Path Length per Goal                                             42.50
-Difference (actual - planned)                                                3.25
+Planned Avg Path Length per Goal                                            45.00
+Actual Avg Path Length per Goal                                             53.75
+Difference (actual - planned)                                                8.75
 
 REPLANNING METRICS
 --------------------------------------------------------------------------------
-Total Number of Replans                                                        30
-Average Replans per Goal                                                     3.75
+Total Number of Replans                                                        32
+Average Replans per Goal                                                     4.00
 ================================================================================
 
-Generated: 2025-11-07 16:21:22
+Generated: 2025-11-07 18:14:51

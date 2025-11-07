@@ -18,8 +18,7 @@ from metrics import save_metrics_to_csv, get_next_run_number
 # Parse command-line arguments
 parser = argparse.ArgumentParser(description='Warehouse Robot Simulation')
 parser.add_argument('--algo', type=str, default='A*', 
-                    choices=['A*', 'astar', 'A-star', 'A_star', 'dijkstra', 'Dijkstra', 
-                            'rrt', 'RRT', 'prm', 'PRM'],
+                    choices=['A*', 'astar', 'A-star', 'A_star', 'dijkstra', 'Dijkstra'],
                     help='Pathfinding algorithm to use (default: A*)')
 parser.add_argument('--map', type=str, default='map1',
                     choices=['map1', 'map2', 'map3', 'map4'],
@@ -32,16 +31,12 @@ parser.add_argument('--obstacle-speed', type=int, default=350,
                     help='Dynamic obstacle movement cooldown in milliseconds (default: 350ms, lower = faster)')
 args = parser.parse_args()
 
-# Normalize algorithm name (robot expects: 'A*', 'DIJKSTRA', 'RRT', 'PRM')
+# Normalize algorithm name (robot expects: 'A*', 'DIJKSTRA')
 algorithm = args.algo.replace('*', 'star').replace('-', '').replace('_', '').upper()
 if algorithm == 'ASTAR':
     algorithm = 'A*'
 elif algorithm == 'DIJKSTRA':
     algorithm = 'DIJKSTRA'
-elif algorithm == 'RRT':
-    algorithm = 'RRT'
-elif algorithm == 'PRM':
-    algorithm = 'PRM'
 
 # Initialize pygame
 pygame.init()

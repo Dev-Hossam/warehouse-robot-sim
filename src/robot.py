@@ -13,8 +13,6 @@ from lidar import LidarSensor
 from isam import ISAM
 from astar import astar, plan_multi_goal_path
 from dijkstra import dijkstra
-from rrt import rrt
-from prm import prm
 from local_mapper import LocalMapper, LOCAL_DYNAMIC_OCCUPIED, DynamicObstacleTracker
 
 DEBUG = True
@@ -39,7 +37,7 @@ class Robot:
             y: Starting y coordinate
             ogm: Occupancy Grid Map for mapping
             warehouse: Warehouse object (for validation)
-            pathfinding_algorithm: Pathfinding algorithm to use ('A*', 'Dijkstra', 'RRT', 'PRM')
+            pathfinding_algorithm: Pathfinding algorithm to use ('A*', 'Dijkstra')
             move_cooldown: Movement cooldown in milliseconds (default: 100ms)
         """
         # Validate starting position
@@ -76,7 +74,7 @@ class Robot:
         
         # Pathfinding algorithm
         self.pathfinding_algorithm = pathfinding_algorithm.upper()
-        if self.pathfinding_algorithm not in ['A*', 'ASTAR', 'DIJKSTRA', 'RRT', 'PRM']:
+        if self.pathfinding_algorithm not in ['A*', 'ASTAR', 'DIJKSTRA']:
             debug_log(f"Warning: Unknown pathfinding algorithm '{pathfinding_algorithm}', using A*")
             self.pathfinding_algorithm = 'A*'
         
@@ -605,10 +603,6 @@ class Robot:
             path = astar(start, target, integrated_ogm, allow_goals=allow_goals, allow_unknown=allow_unknown)
         elif self.pathfinding_algorithm == 'DIJKSTRA':
             path = dijkstra(start, target, integrated_ogm, allow_goals=allow_goals)
-        elif self.pathfinding_algorithm == 'RRT':
-            path = rrt(start, target, integrated_ogm, allow_goals=allow_goals)
-        elif self.pathfinding_algorithm == 'PRM':
-            path = prm(start, target, integrated_ogm, allow_goals=allow_goals)
         else:
             # Fallback to A*
             path = astar(start, target, integrated_ogm, allow_goals=allow_goals, allow_unknown=allow_unknown)
@@ -618,7 +612,7 @@ class Robot:
     def pathfind_cached(self, start, target, allow_goals=True, allow_unknown=False):
         """
         Pathfinding with caching to avoid redundant calculations.
-        Uses the selected pathfinding algorithm (A*, Dijkstra, RRT, or PRM).
+        Uses the selected pathfinding algorithm (A* or Dijkstra).
         Validates cached paths against local map for dynamic obstacles.
         
         Args:
@@ -1520,8 +1514,6 @@ class Robot:
             path_colors = {
                 'A*': (255, 0, 0),      # Red
                 'DIJKSTRA': (0, 100, 255),  # Bright Blue
-                'RRT': (255, 140, 0),     # Orange
-                'PRM': (200, 0, 200)      # Magenta
             }
             path_color = path_colors.get(self.pathfinding_algorithm, (255, 0, 0))
             
